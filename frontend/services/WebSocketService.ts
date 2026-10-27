@@ -1,8 +1,4 @@
-/**
- * WebSocket Service - Communication complète via WebSocket
- */
 import { io, Socket } from "socket.io-client";
-import { generateConnectionUrls } from "../config/ports";
 
 export type ConnectionStatus =
   | "disconnected"
@@ -15,20 +11,44 @@ export interface BotConfig {
   threads: number;
   timeout?: number;
   proxyType?: string;
-  stabilityMode?: boolean;
   proxyFile?: File;
-  subscriptionStatus?: boolean;
+  reconnect?: boolean;
 }
 
 export interface BotStats {
   is_running: boolean;
   channel_name?: string;
+  video_id?: string | null;
   active_threads: number;
+  active_connections: number;
+  session_counts?: {
+    starting: number;
+    playing: number;
+    buffering: number;
+    retrying: number;
+    ended: number;
+    failed: number;
+    stopped: number;
+  };
   total_proxies: number;
-  alive_proxies: number;
   request_count: number;
-  config: any;
-  status: any;
+  successful_sessions: number;
+  failed_attempts: number;
+  last_error: { code: string; message: string } | null;
+  config: {
+    threads?: number;
+    timeout?: number;
+    proxy_type?: string;
+    reconnect?: boolean;
+  };
+  status: {
+    state: string;
+    message: string;
+    proxy_count: number;
+    proxy_loading_progress: number;
+    startup_progress: number;
+    error_code: string | null;
+  };
   system_metrics: {
     cpu: number;
     memory: number;
@@ -41,8 +61,8 @@ interface Callbacks {
   onConnect?: () => void;
   onDisconnect?: () => void;
   onStatsUpdate?: (stats: BotStats) => void;
-  onBotStarted?: (data: any) => void;
-  onBotStopped?: (data: any) => void;
+  onBotStarted?: () => void;
+  onBotStopped?: () => void;
   onBotError?: (error: string) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
 }
@@ -50,226 +70,93 @@ interface Callbacks {
 class WebSocketService {
   private socket: Socket | null = null;
   private status: ConnectionStatus = "disconnected";
-  private callbacks: Callbacks = {};
-
-  // URLs possibles pour le service local (générées depuis la config partagée)
-  private urls = generateConnectionUrls();
-
-  private currentUrl = "";
+  private callbacks: Callbacks;
 
   constructor(callbacks: Callbacks = {}) {
     this.callbacks = callbacks;
   }
 
-  /**
-   * Se connecter au service WebSocket
-   */
-  async connect(): Promise<boolean> {
+  connect(): void {
+    if (this.socket?.connected || this.status === "connecting") return;
+    this.socket?.disconnect();
     this.updateStatus("connecting");
-
-    for (const url of this.urls) {
-      console.log(`Tentative de connexion à ${url}...`);
-
-      const success = await this.tryConnect(url);
-      if (success) {
-        this.currentUrl = url;
-        console.log(`✅ Connecté à ${url}`);
-        return true;
-      }
-    }
-
-    this.updateStatus("error");
-    this.callbacks.onBotError?.("Impossible de se connecter au service local");
-    return false;
-  }
-
-  /**
-   * Essayer de se connecter à une URL spécifique
-   */
-  private tryConnect(url: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      const socket = io(url, {
-        transports: ["websocket", "polling"],
-        reconnection: false,
-        timeout: 3000,
-      });
-
-      const timeout = setTimeout(() => {
-        socket.close();
-        resolve(false);
-      }, 3000);
-
-      socket.on("connect", () => {
-        clearTimeout(timeout);
-        this.socket = socket;
-        this.setupEventHandlers();
-        this.updateStatus("connected");
-        this.callbacks.onConnect?.();
-        resolve(true);
-      });
-
-      socket.on("connect_error", () => {
-        clearTimeout(timeout);
-        socket.close();
-        resolve(false);
-      });
+    // Same-origin polling works both locally and through a hosted preview. Next
+    // proxies /socket.io to the Python backend; no browser-side localhost URLs.
+    const socket = io({
+      path: "/socket.io/",
+      transports: ["polling"],
+      timeout: 5000,
+      reconnection: true,
+      reconnectionDelay: 1500,
     });
-  }
-
-  /**
-   * Configurer les gestionnaires d'événements
-   */
-  private setupEventHandlers() {
-    if (!this.socket) return;
-
-    this.socket.on("connected", (data) => {
-      console.log("Serveur connecté:", data);
+    this.socket = socket;
+    socket.on("connect", () => {
+      this.updateStatus("connected");
+      this.callbacks.onConnect?.();
     });
-
-    this.socket.on("stats_update", (stats: BotStats) => {
-      this.callbacks.onStatsUpdate?.(stats);
-    });
-
-    this.socket.on("bot_started", (data) => {
-      console.log("Bot démarré:", data);
-      this.callbacks.onBotStarted?.(data);
-    });
-
-    this.socket.on("bot_stopped", (data) => {
-      console.log("Bot arrêté:", data);
-      this.callbacks.onBotStopped?.(data);
-    });
-
-    this.socket.on("bot_status_changed", (data) => {
-      console.log("Statut bot changé:", data);
-    });
-
-    this.socket.on("bot_error", (error) => {
-      console.error("Erreur bot:", error);
-      this.callbacks.onBotError?.(error.error || "Erreur inconnue");
-    });
-
-    this.socket.on("disconnect", () => {
+    socket.on("connect_error", () => this.updateStatus("error"));
+    socket.on("disconnect", () => {
       this.updateStatus("disconnected");
       this.callbacks.onDisconnect?.();
     });
-
-    this.socket.on("pong", (data) => {
-      console.log("Pong reçu:", data);
-    });
+    socket.on("stats_update", (stats: BotStats) =>
+      this.callbacks.onStatsUpdate?.(stats),
+    );
+    socket.on("bot_started", () => this.callbacks.onBotStarted?.());
+    socket.on("bot_stopped", () => this.callbacks.onBotStopped?.());
+    socket.on("bot_error", (error: { error?: string }) =>
+      this.callbacks.onBotError?.(error.error || "Unknown backend error"),
+    );
   }
 
-  /**
-   * Démarrer le bot
-   */
   async startBot(config: BotConfig): Promise<void> {
-    if (!this.socket || this.status !== "connected") {
-      throw new Error("Service non connecté");
-    }
-
+    if (!this.socket?.connected) throw new Error("Backend is not connected.");
     const data: Record<string, unknown> = {
       channelName: config.channelName,
       threads: config.threads,
-      timeout: config.timeout || 10000,
-      proxyType: config.proxyType || "http",
-      stabilityMode: config.stabilityMode || false,
-      subscriptionStatus: config.subscriptionStatus || "unknown",
+      timeout: config.timeout ?? 15000,
+      proxyType: config.proxyType ?? "http",
+      reconnect: config.reconnect ?? true,
     };
-
-    // Si un fichier proxy est fourni, le convertir en base64
     if (config.proxyFile) {
-      const base64 = await this.fileToBase64(config.proxyFile);
-      data.proxyFileData = base64;
-      data.proxyFileName = config.proxyFile.name;
+      if (config.proxyFile.size > 1_000_000)
+        throw new Error("Proxy file must be at most 1 MB.");
+      data.proxyFileData = await this.fileToBase64(config.proxyFile);
     }
-
-    this.socket.emit("start_bot", data);
+    const result = await this.socket
+      .timeout(10000)
+      .emitWithAck("start_bot", data);
+    if (!result?.success)
+      throw new Error(result?.error || "Could not start sessions.");
   }
 
-  /**
-   * Arrêter le bot
-   */
-  stopBot(): void {
-    if (!this.socket || this.status !== "connected") {
-      throw new Error("Service non connecté");
-    }
-
-    this.socket.emit("stop_bot");
+  async stopBot(): Promise<void> {
+    if (!this.socket?.connected) throw new Error("Backend is not connected.");
+    const result = await this.socket.timeout(10000).emitWithAck("stop_bot");
+    if (!result?.success)
+      throw new Error(result?.error || "Could not stop sessions.");
   }
 
-  /**
-   * Demander les statistiques
-   */
   getStats(): void {
-    if (!this.socket || this.status !== "connected") {
-      return;
-    }
-
-    this.socket.emit("get_stats");
+    if (this.socket?.connected) this.socket.emit("get_stats");
   }
 
-  /**
-   * Ping le serveur
-   */
-  ping(): void {
-    if (!this.socket || this.status !== "connected") {
-      return;
-    }
-
-    this.socket.emit("ping");
-  }
-
-  /**
-   * Se déconnecter
-   */
   disconnect(): void {
-    if (this.socket) {
-      this.socket.disconnect();
-      this.socket = null;
-    }
+    this.socket?.disconnect();
+    this.socket = null;
     this.updateStatus("disconnected");
   }
 
-  /**
-   * Obtenir le statut de connexion
-   */
-  getStatus(): ConnectionStatus {
-    return this.status;
-  }
-
-  /**
-   * Obtenir l'URL actuelle
-   */
-  getCurrentUrl(): string {
-    return this.currentUrl;
-  }
-
-  /**
-   * Vérifier si connecté
-   */
-  isConnected(): boolean {
-    return this.status === "connected";
-  }
-
-  /**
-   * Mettre à jour le statut
-   */
   private updateStatus(status: ConnectionStatus) {
     this.status = status;
     this.callbacks.onStatusChange?.(status);
   }
 
-  /**
-   * Convertir un fichier en base64
-   */
   private fileToBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = () => {
-        const base64 = (reader.result as string).split(",")[1];
-        resolve(base64);
-      };
-      reader.onerror = reject;
+      reader.onload = () => resolve((reader.result as string).split(",")[1]);
+      reader.onerror = () => reject(new Error("Could not read proxy file."));
       reader.readAsDataURL(file);
     });
   }

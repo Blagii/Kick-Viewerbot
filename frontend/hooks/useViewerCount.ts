@@ -1,52 +1,59 @@
-import { useState, useEffect, useRef } from "react";
-import { getViewerCount } from "../app/functions/KickAPI";
+import { useEffect, useState } from "react";
 
-// NOTE: To prevent hydration mismatches, the initial value is deterministic (0) and
-// we avoid including viewerCount in dependency array (which caused redefinition of interval).
-// Fetch starts only on client after mount and username presence.
-export function useViewerCount(username: string | undefined) {
-  const [viewerCount, setViewerCount] = useState(0);
-  const [previousCount, setPreviousCount] = useState(0);
-  const [lastUpdate, setLastUpdate] = useState<number | null>(null);
-  const fetchingRef = useRef(false);
-  const mountedRef = useRef(false);
+interface ViewerCountResult {
+  viewerCount: number | null;
+  message: string;
+}
 
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
+export function useViewerCount(target: string) {
+  const [result, setResult] = useState<ViewerCountResult>({
+    viewerCount: null,
+    message: "Enter a YouTube video or live link.",
+  });
 
   useEffect(() => {
-    if (!username) return;
-    let interval: any;
-
-    const fetchViewerCount = async () => {
-      if (fetchingRef.current) return;
-      fetchingRef.current = true;
+    if (!target.trim()) {
+      setResult({
+        viewerCount: null,
+        message: "Enter a YouTube video or live link.",
+      });
+      return;
+    }
+    const controller = new AbortController();
+    setResult({
+      viewerCount: null,
+      message: "Checking YouTube viewer count...",
+    });
+    const fetchCount = async () => {
       try {
-        const count = await getViewerCount(username);
-        if (!mountedRef.current) return;
-        setPreviousCount((prev) => (prev !== count ? viewerCount : prev));
-        setViewerCount(count);
-        setLastUpdate(Date.now());
-      } catch (e) {
-        // swallow errors silently or add logging if desired
-      } finally {
-        fetchingRef.current = false;
+        const response = await fetch(
+          `/api/youtube/viewers?target=${encodeURIComponent(target.trim())}`,
+          { signal: controller.signal, cache: "no-store" },
+        );
+        const data = await response.json();
+        if (!controller.signal.aborted)
+          setResult({
+            viewerCount:
+              typeof data.viewer_count === "number" ? data.viewer_count : null,
+            message: data.message || "Viewer count unavailable.",
+          });
+      } catch {
+        if (!controller.signal.aborted)
+          setResult({
+            viewerCount: null,
+            message: "Could not reach the backend for viewer statistics.",
+          });
       }
     };
-
-    // Defer first fetch to next tick (ensure client only)
-    const timeout = setTimeout(fetchViewerCount, 0);
-    interval = setInterval(fetchViewerCount, 2500);
-
+    // Debounce typing and keep quota use modest.
+    const initial = setTimeout(fetchCount, 900);
+    const interval = setInterval(fetchCount, 60000);
     return () => {
-      clearTimeout(timeout);
+      controller.abort();
+      clearTimeout(initial);
       clearInterval(interval);
     };
-  }, [username]);
+  }, [target]);
 
-  return { viewerCount, previousCount, lastUpdate };
+  return result;
 }

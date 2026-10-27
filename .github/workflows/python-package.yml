@@ -1,193 +1,36 @@
-name: Build and Release
+name: YouTube dashboard CI
 
 on:
   push:
-    tags:
-      - "*"
-    branches:
-      - "main"
+    branches: [main]
   pull_request:
-    branches:
-      - "main"
+    branches: [main]
 
 jobs:
-  build-windows:
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: "18"
-
-      - name: Install Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-          architecture: "x64"
-
-      - name: Setup Python and venv
-        run: |
-          python -m venv venv
-          .\venv\Scripts\activate
-          python -m pip install --upgrade pip
-          python -m pip install wheel pyinstaller
-          pip install -r requirements.txt
-          pip install tls-client python-socks[asyncio] typing_extensions
-          pip list
-          python -c "import tls_client; print('tls_client found at:', tls_client.__file__)"
-          python -c "import python_socks; print('python_socks found at:', python_socks.__file__)"
-
-      - name: Build Windows Executable
-        run: |
-          .\venv\Scripts\activate
-          pyinstaller --noconfirm KickViewerBOT.spec
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-build
-          path: dist/KickViewerBOT.exe
-
-  build-macos:
-    runs-on: macos-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: "18"
-
-      - name: Install Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      - name: Setup Python and venv
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          python -m pip install --upgrade pip
-          python -m pip install pyinstaller
-          pip install -r requirements.txt
-          pip install tls-client python-socks[asyncio] typing_extensions
-          pip list
-          python -c "import tls_client; print('tls_client found at:', tls_client.__file__)"
-          python -c "import python_socks; print('python_socks found at:', python_socks.__file__)"
-
-      - name: Build MacOS App
-        run: |
-          source venv/bin/activate
-          pyinstaller --noconfirm KickViewerBOT-macOS.spec
-
-      - name: zip the app
-        run: |
-          cd dist
-          zip -r KickViewerBOT-MacOS.zip KickViewerBOT
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-build
-          path: dist/KickViewerBOT-MacOS.zip
-
-  create-release:
-    needs: [build-windows, build-macos]
+  backend-tests:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Extract tag name
-        id: get_version
-        run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          # Check if tag contains beta, alpha, rc, or preview
-          if [[ "${GITHUB_REF#refs/tags/}" =~ (beta|alpha|rc|preview) ]]; then
-            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
-          else
-            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          path: artifacts
+          python-version: "3.11"
+      - run: python -m pip install -r requirements.txt pytest
+      - run: python -m pytest -q
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ steps.get_version.outputs.VERSION }}
-          prerelease: ${{ steps.get_version.outputs.IS_PRERELEASE }}
-
-          body: |
-            # 🚀 KickViewerBOT v3.0.2 — Proxy WebSocket Support & Version System
-
-            ## ✨ What's New
-
-            ### 🌐 Proxy-Tunneled WebSocket Connections
-
-            Viewer connections now route through your proxies via SOCKS4/SOCKS5/HTTP tunnels. Each viewer appears from a unique IP address, dramatically improving viewer count accuracy and scalability.
-
-            - 🎯 Each WebSocket connection is tunneled through a dedicated proxy
-            - 📈 More stable and accurate viewer counts on Kick
-            - 🛡️ Supports SOCKS4, SOCKS5, and HTTP proxies with authentication
-            - ⚡ Automatic fallback to direct connection if a proxy fails
-
-            ### 🔥 Stability Mode Enhancements
-
-            - 🎯 Persistent connections with regular handshakes and session maintenance
-            - 📈 Periodic tracking events to keep viewer counts stable
-            - 🛡️ Full Kick protocol compliance: ping/pong, user_event, error handling
-            - ⚡ "Set & forget" mode with monitoring and automatic reconnection
-
-            ## 🐛 Fixes & Improvements
-
-            - ✅ Fixed viewer count dropping after 1 minute
-            - ✅ Improved WebSocket message handling and Kick protocol compliance
-            - ✅ Better resilience with exponential backoff on reconnections
-            - ✅ Enhanced proxy rotation and token management
-            - ✅ No admin/UAC required — uses non-reserved ports automatically
-            - ✅ Frontend: correct display of active connections count
-
-            ---
-
-            ## 📥 Getting Started
-
-            1. Download the executable for your platform below
-            2. Run `KickViewerBOT` — no admin privileges required
-            3. Load your proxies and enable **Stability Mode** for best results
-
-            **Need help?** Open an issue: https://github.com/H1B0B0/Kick-Viewerbot/issues
-
-            *Thanks for your support!* 🙏
-
-          draft: false
-
-      - name: Upload Windows Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts/windows-build/KickViewerBOT.exe
-          asset_name: KickViewerBOT-Windows.exe
-          asset_content_type: application/octet-stream
-
-      - name: Upload MacOS Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts/macos-build/KickViewerBOT-MacOS.zip
-          asset_name: KickViewerBOT-MacOS.zip
-          asset_content_type: application/zip
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run lint
+        working-directory: frontend
+      - run: npm exec -- tsc --noEmit
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend

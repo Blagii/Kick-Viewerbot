@@ -1,879 +1,540 @@
-import sys
-import time
-import random
-import logging
-import requests
-import datetime
-import threading
+"""Isolated browser sessions for YouTube live playback.
+
+YouTube does not expose Kick's viewer WebSocket protocol. Each worker instead
+opens the actual YouTube player in its own Chromium context. Playback is not a
+promise that YouTube will count the session as a viewer.
+"""
+
 import asyncio
-import websockets
-import json
-import traceback
-from threading import Thread
-from streamlink import Streamlink
-from threading import Semaphore
-from rich.console import Console
-from fake_useragent import UserAgent
-from urllib.parse import urlparse
+import logging
+import os
+import re
+import threading
+from urllib.parse import unquote, urlsplit
 
-# Try to import tls_client for better fingerprinting
-try:
-    import tls_client
-    HAS_TLS_CLIENT = True
-except ImportError as e:
-    HAS_TLS_CLIENT = False
-    logging.warning(f"tls_client not available: {e}")
-    logging.warning("Using requests as fallback (risk of detection)")
+from .youtube import normalize_youtube_target, youtube_video_id
 
-# Add this near the top of the file, after imports
-logging.getLogger("urllib3").setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
+MAX_SESSIONS = 100
+# Try a small number of different proxies before giving up on initial playback,
+# regardless of whether post-playback reconnection is enabled.
+MAX_STARTUP_PROXY_ATTEMPTS = 5
+STARTUP_PROXY_RETRY_DELAY = 0.5
+RECONNECT_BASE_DELAY = 5
+MAX_RECONNECT_DELAY = 60
+PLAYER_CHECK_INTERVAL = 5
+PLAYER_STALL_CHECKS = 3
+SESSION_STATES = ("starting", "playing", "buffering", "retrying", "ended", "failed", "stopped")
 
-console = Console()
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+class PlaybackFailure(Exception):
+    """An expected playback failure containing only a safe, actionable message."""
 
-# Session creating for request
-ua = UserAgent()
-session = Streamlink()
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
-# Kick WebSocket configuration
-CLIENT_TOKEN = "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823"
-WS_HEADERS = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Connection': 'keep-alive',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1',
-    'User-Agent': ua.random,
-    'sec-ch-ua': '"Chromium";v="137", "Google Chrome";v="137", "Not-A.Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-}
-session.set_option("http-headers", {
-    "Accept-Language": "en-US,en;q=0.5",
-    "Connection": "keep-alive",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-    "User-Agent": ua.random,
-    "Client-ID": "ewvlchtxgqq88ru9gmfp1gmyt6h2b93",
-    "Referer": "https://www.google.com/"
-})
+
+def http_playback_failure(status: int) -> PlaybackFailure:
+    if status == 407:
+        return PlaybackFailure(
+            "proxy_auth_required",
+            "The proxy requires authentication. Check its username and password.",
+        )
+    if status == 429:
+        return PlaybackFailure(
+            "http_rate_limited",
+            "The request was rate limited (HTTP 429). Wait and check the connection or proxy.",
+        )
+    if status == 403:
+        return PlaybackFailure(
+            "http_forbidden",
+            "The request was refused (HTTP 403). Check the video, network and proxy.",
+        )
+    if status >= 500:
+        return PlaybackFailure(
+            "http_server_error",
+            f"The request failed with HTTP {status}. Check the service and proxy.",
+        )
+    return PlaybackFailure(
+        "http_error",
+        f"The request failed with HTTP {status}. Check the video URL and proxy.",
+    )
+
+
+def diagnose_playback_error(exc: Exception, stage: str, using_proxy: bool) -> tuple[str, str]:
+    """Classify common errors without returning URLs, credentials or exception text."""
+    if isinstance(exc, PlaybackFailure):
+        return exc.code, exc.message
+
+    # Playwright includes request URLs in exception messages. Read only known error
+    # tokens and never copy the rest of the exception into logs or status events.
+    match = re.search(r"\bnet::(ERR_[A-Z_]+)\b", str(exc))
+    network_error = match.group(1) if match else ""
+    if network_error in {"ERR_PROXY_AUTH_REQUESTED", "ERR_INVALID_AUTH_CREDENTIALS"}:
+        return "proxy_auth_required", "The proxy rejected authentication. Check its credentials."
+    if network_error in {
+        "ERR_PROXY_CONNECTION_FAILED",
+        "ERR_TUNNEL_CONNECTION_FAILED",
+        "ERR_MANDATORY_PROXY_CONFIGURATION_FAILED",
+        "ERR_NO_SUPPORTED_PROXIES",
+        "ERR_SOCKS_CONNECTION_FAILED",
+        "ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+    }:
+        return (
+            "proxy_connection_failed",
+            "The proxy connection failed or was blocked. Check the proxy and network access.",
+        )
+    if network_error in {"ERR_NAME_NOT_RESOLVED", "ERR_NAME_RESOLUTION_FAILED", "ERR_DNS_TIMED_OUT"}:
+        return (
+            "dns_failed",
+            "A hostname could not be resolved. Check DNS, network access and any proxy.",
+        )
+    if network_error in {
+        "ERR_CERT_AUTHORITY_INVALID",
+        "ERR_CERT_COMMON_NAME_INVALID",
+        "ERR_CERT_DATE_INVALID",
+        "ERR_PROXY_CERTIFICATE_INVALID",
+    }:
+        return (
+            "certificate_error",
+            "A TLS certificate was rejected. Check the system clock, network and proxy.",
+        )
+    if network_error in {"ERR_SSL_PROTOCOL_ERROR", "ERR_SSL_VERSION_OR_CIPHER_MISMATCH"}:
+        return "tls_failed", "The TLS connection failed. Check the network and proxy."
+    if network_error in {"ERR_CONNECTION_TIMED_OUT", "ERR_TIMED_OUT"} or "timeout" in type(exc).__name__.lower():
+        if stage == "player":
+            return (
+                "player_timeout",
+                "The video player did not appear in time. Check the video, network and proxy.",
+            )
+        if stage == "playback":
+            return (
+                "playback_timeout",
+                "Playback did not start in time. Check the video, network and proxy.",
+            )
+        return (
+            "connection_timeout",
+            "The connection timed out. Check network access and any proxy, or increase the timeout.",
+        )
+    if network_error in {
+        "ERR_CONNECTION_REFUSED",
+        "ERR_CONNECTION_CLOSED",
+        "ERR_CONNECTION_RESET",
+        "ERR_CONNECTION_ABORTED",
+        "ERR_CONNECTION_FAILED",
+        "ERR_EMPTY_RESPONSE",
+        "ERR_ADDRESS_UNREACHABLE",
+        "ERR_INTERNET_DISCONNECTED",
+        "ERR_NETWORK_CHANGED",
+        "ERR_NETWORK_ACCESS_DENIED",
+        "ERR_NETWORK_ACCESS_REVOKED",
+    }:
+        return (
+            "network_connection_failed",
+            "The network connection failed or was interrupted. Check network access and any proxy.",
+        )
+    if stage == "proxy_setup" and using_proxy:
+        return "proxy_setup_failed", "The browser could not use the proxy. Check its format and protocol."
+    if stage == "browser_setup":
+        return "browser_context_failed", "The browser could not open a session. Check its installation and resources."
+    if stage == "playback":
+        return (
+            "playback_failed",
+            "The player could not start playback. Check that the stream is public and available.",
+        )
+    if stage == "player":
+        return (
+            "player_unavailable",
+            "The video player could not be loaded. Check the video, network and proxy.",
+        )
+    if using_proxy:
+        return (
+            "connection_failed",
+            "The page could not be loaded through the proxy. Check its protocol and network access.",
+        )
+    return (
+        "connection_failed",
+        "The page could not be loaded. Check the video URL and network access.",
+    )
+
+
+def parse_proxy(line: str, default_type: str = "http") -> dict:
+    """Parse one HTTP/SOCKS proxy for Playwright without logging credentials."""
+    raw = line.strip()
+    if "://" not in raw:
+        raw = f"{default_type if default_type != 'all' else 'http'}://{raw}"
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise ValueError("Invalid proxy address or port.") from None
+    if (scheme not in {"http", "https", "socks4", "socks5"} or not host or not port
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError("Expected an HTTP, SOCKS4, or SOCKS5 proxy with a host and port.")
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid proxy port.")
+    username, password = parsed.username, parsed.password
+    if scheme.startswith("socks") and (username is not None or password is not None):
+        raise ValueError("Chromium does not support authenticated SOCKS proxies; use an HTTP proxy instead.")
+    if (username is None) != (password is None):
+        raise ValueError("Proxy credentials must include both username and password.")
+    # IPv6 literals need brackets in the proxy URI.
+    host = f"[{host}]" if ":" in host else host
+    result = {"server": f"{scheme}://{host}:{port}"}
+    if username is not None:
+        result.update(username=unquote(username), password=unquote(password))
+    return result
+
+
+def parse_proxy_list(text: str, default_type: str = "http") -> list:
+    proxies = []
+    seen = set()
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            proxy = parse_proxy(line, default_type)
+        except ValueError as exc:
+            raise ValueError(f"Proxy on line {number}: {exc}") from None
+        identity = (proxy["server"], proxy.get("username"), proxy.get("password"))
+        if identity not in seen:
+            seen.add(identity)
+            proxies.append(proxy)
+    if not proxies:
+        raise ValueError("The proxy file is empty or contains no proxies.")
+    return proxies
+
 
 class ViewerBot:
-    def __init__(self, nb_of_threads, channel_name, proxy_file=None, proxy_imported=False, timeout=10000, type_of_proxy="http"):
-        self.proxy_imported = proxy_imported
-        self.proxy_file = proxy_file
+    def __init__(self, nb_of_threads, channel_name, proxy_text=None, timeout=15000,
+                 type_of_proxy="http", reconnect=True):
         self.nb_of_threads = int(nb_of_threads)
-        self.channel_name = self.extract_channel_name(channel_name)
-        self.request_count = 0  # Total requests
-        self.all_proxies = []
-        self.processes = []
-        self.proxyrefreshed = False
-        self.channel_url = "https://kick.com/" + self.channel_name
-        self.thread_semaphore = Semaphore(int(nb_of_threads))  # Semaphore to control thread count
+        if not 1 <= self.nb_of_threads <= MAX_SESSIONS:
+            raise ValueError(f"Sessions must be between 1 and {MAX_SESSIONS}.")
+        self.timeout = int(timeout)
+        if not 1000 <= self.timeout <= 120000:
+            raise ValueError("Timeout must be between 1000 and 120000 milliseconds.")
+        if type_of_proxy not in {"http", "socks4", "socks5", "all"}:
+            raise ValueError("Unsupported default proxy type.")
+        self.channel_url = normalize_youtube_target(channel_name)
+        self.channel_name = channel_name.strip()
+        self.video_id = youtube_video_id(self.channel_url)
+        self.all_proxies = parse_proxy_list(proxy_text, type_of_proxy) if proxy_text is not None else []
+        self.reconnect = bool(reconnect)
         self.active_threads = 0
-        self.should_stop = False
-        self.timeout = timeout
-        self.type_of_proxy = type_of_proxy
-        self.proxies = []  # Add this to store proxies only once
-        self.request_per_second = 0  # Add counter for requests per second
-        self.requests_in_current_second = 0
-        self.last_request_time = time.time()
+        self.active_connections = 0
+        self.request_count = 0  # Number of browser playback attempts, not YouTube views.
+        self.successful_sessions = 0
+        self.failed_attempts = 0
+        self.last_error = None
+        self._session_states = ["starting"] * self.nb_of_threads
         self.status = {
-            'state': 'initialized',  # Current state of the bot
-            'message': 'Bot initialized',  # Status message
-            'proxy_count': 0,  # Number of proxies currently loaded
-            'proxy_loading_progress': 0,  # Progress when loading proxies (0-100)
-            'startup_progress': 0  # Overall startup progress (0-100)
+            "state": "initialized", "message": "Ready to start YouTube playback.",
+            "proxy_count": len(self.all_proxies), "proxy_loading_progress": 100,
+            "startup_progress": 0, "error_code": None,
         }
-        self.stream_url_cache = None
-        self.stream_url_last_updated = 0
-        self.stream_url_lock = threading.Lock()
-        self.stream_url_cache_duration = 0.5  # Cache stream URL for 0.2 seconds
-        self.channel_id = None  # Store channel ID for WebSocket connections
-        logging.debug(f"Type of proxy: {self.type_of_proxy}")
-        logging.debug(f"Timeout: {self.timeout}")
-        logging.debug(f"Proxy imported: {self.proxy_imported}")
-        logging.debug(f"Proxy file: {self.proxy_file}")
-        logging.debug(f"Number of threads: {self.nb_of_threads}")
-        logging.debug(f"Channel name: {self.channel_name}")
+        self._proxy_cursor = 0
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._loop = None
+        self._async_stop = None
 
-    def get_channel_id(self):
-        """Get the channel ID from Kick API using multiple fallback methods"""
-        try:
-            # Method 1: Try v2 API with tls_client (like working example)
-            if HAS_TLS_CLIENT:
-                try:
-                    s = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
-                    s.headers.update({
-                        'Accept': 'application/json, text/plain, */*',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'Referer': 'https://kick.com/',
-                        'Origin': 'https://kick.com',
-                        'DNT': '1',
-                        'Connection': 'keep-alive',
-                        'Sec-Fetch-Dest': 'empty',
-                        'Sec-Fetch-Mode': 'cors',
-                        'Sec-Fetch-Site': 'same-origin',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': '"Windows"',
-                    })
-                    response = s.get(f'https://kick.com/api/v2/channels/{self.channel_name}')
-                    if response.status_code == 200:
-                        data = response.json()
-                        self.channel_id = data.get("id")
-                        logging.debug(f"Retrieved channel ID from v2 API with tls_client: {self.channel_id}")
-                        return self.channel_id
-                    else:
-                        logging.debug(f"v2 API with tls_client failed: {response.status_code}")
-                except Exception as e:
-                    logging.debug(f"tls_client v2 API failed: {e}")
-            
-            # Method 2: Try v1 API with requests (fallback)
-            try:
-                headers = {
-                    'User-Agent': ua.random,
-                    'Accept': 'application/json',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Referer': f'https://kick.com/{self.channel_name}',
-                }
-                response = requests.get(f'https://kick.com/api/v1/channels/{self.channel_name}', 
-                                      headers=headers, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    self.channel_id = data.get("id")
-                    logging.debug(f"Retrieved channel ID from v1 API: {self.channel_id}")
-                    return self.channel_id
-            except Exception as e:
-                logging.debug(f"v1 API failed: {e}")
-            
-            # Method 3: Try scraping the channel page directly
-            try:
-                headers = {
-                    'User-Agent': ua.random,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                }
-                response = requests.get(f'https://kick.com/{self.channel_name}', 
-                                      headers=headers, timeout=15, allow_redirects=True)
-                if response.status_code == 200:
-                    import re
-                    # Look for channel data in the page
-                    patterns = [
-                        r'"id":(\d+).*?"slug":"' + re.escape(self.channel_name) + r'"',
-                        r'"channel_id":(\d+)',
-                        r'channelId["\']:\s*(\d+)',
-                        r'channel.*?id["\']:\s*(\d+)'
-                    ]
-                    
-                    for pattern in patterns:
-                        match = re.search(pattern, response.text, re.IGNORECASE)
-                        if match:
-                            self.channel_id = int(match.group(1))
-                            logging.debug(f"Retrieved channel ID from page scraping: {self.channel_id}")
-                            return self.channel_id
-                            
-                    logging.warning("Could not find channel ID in page content")
-            except Exception as e:
-                logging.debug(f"Page scraping failed: {e}")
-            
-            logging.error(f"All methods failed to get channel ID for: {self.channel_name}")
-            return None
-            
-        except Exception as e:
-            logging.error(f"Error getting channel ID: {e}")
-            return None
+    def _update_status(self, state, message, progress=None, error_code=None):
+        with self._lock:
+            self.status.update(state=state, message=message, error_code=error_code)
+            if progress is not None:
+                self.status["startup_progress"] = progress
 
-    def get_websocket_token(self):
-        """Get WebSocket authentication token using tls_client if available"""
-        try:
-            # Method 1: Use tls_client (like working example)
-            if HAS_TLS_CLIENT:
-                try:
-                    s = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
-                    
-                    # Use more realistic headers
-                    s.headers.update({
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'Connection': 'keep-alive',
-                        'Sec-Fetch-Dest': 'document',
-                        'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-Site': 'none',
-                        'Sec-Fetch-User': '?1',
-                        'Upgrade-Insecure-Requests': '1',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                        'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': '"Windows"',
-                    })
-                    
-                    # Visit main page first to get session and cookies
-                    try:
-                        session_resp = s.get("https://kick.com", timeout_seconds=15)
-                        logging.debug(f"TLS client session request status: {session_resp.status_code}")
-                    except Exception as e:
-                        logging.warning(f"Failed to visit main page: {e}")
+    def _set_session_state(self, index, state):
+        """Update the playback counter and one worker's state atomically."""
+        if state not in SESSION_STATES:
+            raise ValueError("Unknown session state.")
+        with self._lock:
+            previous = self._session_states[index]
+            self.active_connections += int(state == "playing") - int(previous == "playing")
+            self._session_states[index] = state
 
-                    # Small delay to mimic human behavior
-                    time.sleep(random.uniform(0.5, 1.5))
-                    
-                    # Update headers for API request
-                    s.headers.update({
-                        'Accept': 'application/json, text/plain, */*',
-                        'Referer': 'https://kick.com/',
-                        'X-CLIENT-TOKEN': CLIENT_TOKEN,
-                        'Sec-Fetch-Dest': 'empty',
-                        'Sec-Fetch-Mode': 'cors',
-                        'Sec-Fetch-Site': 'same-origin',
-                    })
-                    
-                    # Get WebSocket token
-                    response = s.get('https://websockets.kick.com/viewer/v1/token', timeout_seconds=10)
-                    
-                    logging.debug(f"TLS client token endpoint status: {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        token = data.get("data", {}).get("token")
-                        if token:
-                            logging.info(f"✓ Retrieved fresh WebSocket token")
-                            return token
-                        else:
-                            logging.error("Token endpoint returned 200 but no token in response")
-                    elif response.status_code == 403:
-                        logging.error("Token endpoint returned 403 - CLIENT_TOKEN may be invalid or IP blocked")
-                    else:
-                        logging.debug(f"TLS client token request failed: {response.status_code}")
-                        
-                except Exception as e:
-                    logging.debug(f"tls_client token retrieval failed: {e}")
-            else:
-                logging.warning("tls_client not available - this may result in detection by Kick")
-            
-            # Method 2: Fallback to requests method
-            session = requests.Session()
-            
-            # Step 1: First visit Kick.com to get session cookies
-            initial_headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
+    def _finish_sessions(self):
+        with self._lock:
+            for index, state in enumerate(self._session_states):
+                if state not in {"ended", "failed"}:
+                    self._set_session_state(index, "stopped")
+
+    def _next_proxy(self, excluded):
+        """Rotate across workers while avoiding repeats in one worker's attempt batch."""
+        if not self.all_proxies:
+            return None, None
+        with self._lock:
+            for _ in range(len(self.all_proxies)):
+                proxy_index = self._proxy_cursor % len(self.all_proxies)
+                self._proxy_cursor += 1
+                if proxy_index not in excluded:
+                    return proxy_index, self.all_proxies[proxy_index]
+        raise RuntimeError("Proxy selection exhausted.")
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "active_threads": self.active_threads,
+                "active_connections": self.active_connections,
+                "session_counts": {state: self._session_states.count(state) for state in SESSION_STATES},
+                "request_count": self.request_count,
+                "successful_sessions": self.successful_sessions,
+                "failed_attempts": self.failed_attempts,
+                "last_error": dict(self.last_error) if self.last_error else None,
+                "total_proxies": len(self.all_proxies),
+                "video_id": self.video_id,
+                "status": dict(self.status),
             }
-            
-            try:
-                session_resp = session.get("https://kick.com", headers=initial_headers, timeout=15)
-                if session_resp.status_code != 200:
-                    logging.warning(f"Initial session request status: {session_resp.status_code} - proceeding to token retrieval anyway")
-            except Exception as e:
-                logging.warning(f"Initial session request failed: {e}")
-            
-            time.sleep(random.uniform(0.5, 1.5))
-            
-            # Step 2: Get WebSocket token with client token
-            token_headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Referer': 'https://kick.com/',
-                'Origin': 'https://kick.com',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin',
-                'X-CLIENT-TOKEN': CLIENT_TOKEN,
-                'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-            }
-            
-            # Try multiple endpoints for WebSocket token
-            token_endpoints = [
-                'https://websockets.kick.com/viewer/v1/token',
-                'https://kick.com/api/websocket/token',
-                'https://kick.com/api/v1/websocket/token'
-            ]
-            
-            for endpoint in token_endpoints:
-                try:
-                    response = session.get(endpoint, headers=token_headers, timeout=15)
-                    logging.debug(f"Token endpoint {endpoint} status: {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        token = data.get("data", {}).get("token") or data.get("token")
-                        if token:
-                            logging.debug(f"Retrieved WebSocket token from {endpoint}: {token[:20]}..." if token else "No token")
-                            return token
-                except Exception as e:
-                    logging.debug(f"Token endpoint {endpoint} failed: {e}")
-                    continue
-            
-            logging.error("Failed to get WebSocket token from all endpoints")
-            return None
-            
-        except Exception as e:
-            logging.error(f"Error getting WebSocket token: {e}")
-            return None
-
-    def extract_channel_name(self, input_str):
-        """Extrait le nom de la chaîne d'une URL Kick ou retourne le nom directement"""
-        if "kick.com/" in input_str:
-            # Extraire le nom de la chaîne de l'URL
-            parts = input_str.split("kick.com/")
-            channel = parts[1].split("/")[0].split("?")[0]  # Gérer les paramètres d'URL potentiels
-            return channel.lower()
-        return input_str.lower()
-
-    def update_status(self, state, message, proxy_count=None, proxy_loading_progress=None, startup_progress=None):
-        self.status.update({
-            'state': state,
-            'message': message,
-            **(({'proxy_count': proxy_count} if proxy_count is not None else {})),
-            **(({'proxy_loading_progress': proxy_loading_progress} if proxy_loading_progress is not None else {})),
-            **(({'startup_progress': startup_progress} if startup_progress is not None else {}))
-        })
-        logging.info(f"Status updated: {self.status}")
-
-    def get_proxies(self):
-        self.update_status('loading_proxies', 'Starting proxy collection...')
-        
-        if not self.proxyrefreshed:
-            if self.proxy_file:
-                try:
-                    self.update_status('loading_proxies', 'Loading proxies from file...')
-                    with open(self.proxy_file, 'r') as f:
-                        lines = [self.extract_ip_port(line.strip()) for line in f.readlines() if line.strip()]
-                        self.proxyrefreshed = True
-                        self.update_status('proxies_loaded', f'Loaded {len(lines)} proxies from file', proxy_count=len(lines))
-                        return lines
-                except FileNotFoundError:
-                    self.update_status('error', 'Proxy file not found')
-                    logging.error(f"Proxy file {self.proxy_file} not found.")
-                    sys.exit(1)
-            else:
-                try:
-                    self.update_status('loading_proxies', 'Fetching proxies from API...')
-                    
-                    # Debug: Print current proxy type
-                    logging.debug(f"Fetching proxies with type: {self.type_of_proxy}")
-                    
-                    url = "https://api.proxyscrape.com/v4/free-proxy-list/get"
-                    params = {
-                        'request': 'display_proxies',
-                        'proxy_format': 'protocolipport',
-                        'format': 'text',
-                        'protocol': self.type_of_proxy,
-                        'timeout': self.timeout
-                    }
-                    
-                    headers = {
-                        'User-Agent': ua.random
-                    }
-                    
-                    # Debug: Log request details
-                    logging.debug(f"Request URL: {url}")
-                    logging.debug(f"Request params: {params}")
-                    
-                    response = requests.get(url, params=params, headers=headers, timeout=10)
-                    
-                    # Debug: Log response details
-                    logging.debug(f"Response status code: {response.status_code}")
-                    logging.debug(f"Response headers: {response.headers}")
-                    
-                    if response.status_code == 200:
-                        # Debug: Log first few lines of response
-                        logging.debug(f"First 100 chars of response: {response.text[:100]}")
-                        
-                        lines = [line.strip() for line in response.text.splitlines() if line.strip()]
-                        proxies = []
-                        
-                        # Debug: Log number of lines found
-                        logging.debug(f"Found {len(lines)} proxy lines")
-                        
-                        for idx, line in enumerate(lines):
-                            try:
-                                if '://' in line:
-                                    # Line already has protocol
-                                    proxy_data = self.extract_ip_port(line)
-                                else:
-                                    # Add default http:// if no protocol specified
-                                    proxy_data = self.extract_ip_port(f"http://{line}")
-                                
-                                # Filter by proxy type if specified
-                                if self.type_of_proxy == 'all' or proxy_data[0] == self.type_of_proxy:
-                                    proxies.append(proxy_data)
-                                
-                                # Update progress
-                                progress = int((idx + 1) / len(lines) * 100)
-                                if progress % 10 == 0:
-                                    self.update_status(
-                                        'loading_proxies',
-                                        f'Processing proxies... {progress}%',
-                                        proxy_loading_progress=progress
-                                    )
-                            except Exception as e:
-                                logging.error(f"Error processing proxy line '{line}': {e}")
-                                continue
-                        
-                        if proxies:
-                            self.proxyrefreshed = True
-                            self.update_status(
-                                'proxies_loaded',
-                                f'Successfully loaded {len(proxies)} proxies',
-                                proxy_count=len(proxies),
-                                proxy_loading_progress=100
-                            )
-                            # Debug: Log first few proxies
-                            logging.debug(f"First 5 proxies: {proxies[:5]}")
-                            return proxies
-                        
-                        logging.error("No valid proxies found in response")
-                    else:
-                        logging.error(f"API request failed with status code: {response.status_code}")
-                    
-                    # Si aucun proxy n'est trouvé, essayer une source de secours
-                    backup_response = requests.get(
-                        'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'
-                    )
-                    if backup_response.status_code == 200:
-                        proxies = [
-                            self.extract_ip_port(f"http://{line.strip()}")
-                            for line in backup_response.text.splitlines()
-                            if line.strip()
-                        ]
-                        if proxies:
-                            self.proxyrefreshed = True
-                            self.update_status(
-                                'proxies_loaded',
-                                f'Loaded {len(proxies)} proxies from backup source',
-                                proxy_count=len(proxies),
-                                proxy_loading_progress=100
-                            )
-                            return proxies
-                    
-                    self.update_status('error', 'Failed to fetch proxies from both sources')
-                    return []
-                        
-                except Exception as e:
-                    error_msg = f"Error fetching proxies: {str(e)}"
-                    logging.error(error_msg)
-                    self.update_status('error', error_msg)
-                    return []
-
-    def extract_ip_port(self, proxy):
-        try:
-            protocol = self.type_of_proxy
-            credentials = ""
-            
-            if '://' in proxy:
-                # Format http://user:pass@host:port or socks5://user:pass@host:port
-                parts = proxy.split('://')
-                protocol = parts[0].lower()
-                proxy_part = parts[1]
-            else:
-                # Format IP:PORT or user:pass@host:port without protocol
-                proxy_part = proxy
-            
-            if '@' in proxy_part:
-                credentials_part, host_part = proxy_part.split('@', 1)
-                credentials = credentials_part
-            else:
-                host_part = proxy_part
-                
-            if ':' in host_part:
-                host, port = host_part.split(':', 1)
-                port = port.split('/')[0]
-            else:
-                host = host_part
-                port = '80'
-                
-            if credentials:
-                proxy_address = f"{host}:{port}:{credentials}"
-            else:
-                proxy_address = f"{host}:{port}"
-                
-            # logging.debug(f"Parsed proxy: protocol={protocol}, proxy_address={proxy_address}")
-            return (protocol, proxy_address)
-        except Exception as e:
-            logging.error(f"Error parsing proxy {proxy}: {e}")
-            return (self.type_of_proxy, proxy)  # Fallback to raw format
-    
-    def get_url(self):
-        """Get stream URL with caching to prevent rate limiting"""
-        current_time = time.time()
-        
-        # Use a lock to prevent multiple threads from fetching the URL simultaneously
-        with self.stream_url_lock:
-            # If URL is cached and not expired, return it
-            if (self.stream_url_cache and 
-                current_time - self.stream_url_last_updated < self.stream_url_cache_duration):
-                logging.debug("Using cached stream URL")
-                return self.stream_url_cache
-            
-            # Otherwise, fetch a new URL
-            url = ""
-            try:
-                streams = session.streams(self.channel_url)
-                if streams:
-                    priorities = ['audio_only', '160p', '360p', '480p', '720p', '1080p', 'best', 'worst']
-                    
-                    for quality in priorities:
-                        if quality in streams:
-                            url = streams[quality].url
-                            logging.debug(f"Found stream quality: {quality}")
-                            break
-                    
-                    if not url and streams:
-                        quality = next(iter(streams))
-                        url = streams[quality].url
-                        logging.debug(f"Using first available quality: {quality}")
-                    
-                    # Cache the URL
-                    self.stream_url_cache = url
-                    self.stream_url_last_updated = current_time
-                    logging.debug(f"Updated stream URL cache")
-                else:
-                    logging.warning("No streams available for the channel")
-            except Exception as e:
-                logging.error(f"Error getting stream URL: {e}")
-            
-            return url
 
     def stop(self):
-        console.print("[bold red]Bot has been stopped[/bold red]")
-        self.update_status('stopping', 'Stopping bot...')
-        self.should_stop = True
-        
-        # Stop all threads immediately
-        for thread in self.processes:
-            if thread.is_alive():
-                thread.join(timeout=0.1)
-        
-        # Vider la liste des threads
-        self.processes.clear()
-        self.active_threads = 0
-        self.all_proxies = []
-        self.update_status('stopped', 'Bot has been stopped')
-        logging.debug("Bot stopped and all threads cleaned up")
-
-    def open_url(self, proxy_data):
-        """Legacy method for compatibility - now uses WebSocket approach"""
-        self.send_websocket_view(proxy_data)
-
-
-
-    def send_websocket_view(self, proxy_data):
-        """Send view using WebSocket connection with proper authentication"""
-        self.active_threads += 1
-        try:
-            # Get WebSocket token for this view
-            token = self.get_websocket_token()
-            if not token:
-                logging.error("Failed to get WebSocket token")
-                return
-            
-            # Get channel ID if not already cached
-            if not self.channel_id:
-                self.channel_id = self.get_channel_id()
-                if not self.channel_id:
-                    logging.error("Failed to get channel ID")
-                    return
-            
-            # Run the async WebSocket connection in a new event loop
+        self._stop.set()
+        self._update_status("stopping", "Stopping YouTube sessions...")
+        with self._lock:
+            loop, event = self._loop, self._async_stop
+        if loop and event and not loop.is_closed():
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(self._websocket_worker(token, proxy_data))
-            except Exception as e:
-                logging.error(f"Error in WebSocket worker: {e}")
-            finally:
-                try:
-                    loop.close()
-                except Exception:
-                    pass
-                    
-        except Exception as e:
-            logging.error(f"Error in send_websocket_view: {e}")
-        finally:
-            self.active_threads -= 1
-            self.thread_semaphore.release()
-
-    async def _websocket_worker(self, token, proxy_data):
-        """Async WebSocket worker that maintains connection and sends views"""
-        try:
-            # Stagger connections to avoid all threads starting simultaneously
-            await asyncio.sleep(random.uniform(0, 3))
-            proxy_type, proxy_address = proxy_data['proxy']
-            proxies = self.configure_proxies(proxy_type, proxy_address)
-
-            # Configure WebSocket connection
-            ws_url = f"wss://websockets.kick.com/viewer/v1/connect?token={token}"
-
-            # Create proxy tunnel using python-socks
-            proxy_sock = None
-            try:
-                from python_socks.async_.asyncio import Proxy
-                from python_socks import ProxyType
-                
-                proxy_url = proxies.get('https') or proxies.get('http')
-                if proxy_url:
-                    pt = proxy_type.lower()
-                    if pt == 'socks5':
-                        p_type = ProxyType.SOCKS5
-                    elif pt == 'socks4':
-                        p_type = ProxyType.SOCKS4
-                    else:
-                        p_type = ProxyType.HTTP
-                    
-                    parts = proxy_address.split(':')
-                    p_host = parts[0]
-                    p_port = int(parts[1])
-                    p_user = parts[2] if len(parts) >= 4 else None
-                    p_pass = parts[3] if len(parts) >= 4 else None
-                    
-                    proxy = Proxy(p_type, p_host, p_port, p_user, p_pass)
-                    proxy_sock = await proxy.connect(
-                        dest_host='websockets.kick.com',
-                        dest_port=443
-                    )
-                    logging.debug(f"Proxy tunnel established via {p_host}:{p_port}")
-            except Exception as proxy_err:
-                logging.warning(f"Proxy tunnel failed ({proxy_err}), connecting directly")
-                proxy_sock = None
-            
-            # Connect to WebSocket (through proxy tunnel or directly)
-            connect_kwargs = {
-                'ping_interval': None,
-                'ping_timeout': None,
-            }
-            if proxy_sock is not None:
-                import ssl
-                ssl_context = ssl.create_default_context()
-                connect_kwargs['sock'] = proxy_sock
-                connect_kwargs['ssl'] = ssl_context
-                connect_kwargs['server_hostname'] = 'websockets.kick.com'
-            
-            async with websockets.connect(ws_url, **connect_kwargs) as websocket:
-                logging.debug(f"WebSocket connected for channel {self.channel_id}")
-
-                # Send initial handshake
-                handshake_msg = {
-                    "type": "channel_handshake",
-                    "data": {
-                        "message": {"channelId": self.channel_id}
-                    }
-                }
-                await websocket.send(json.dumps(handshake_msg))
-                logging.debug(f"Sent handshake for channel {self.channel_id}")
-
-                max_pings = random.randint(8, 15)
-                ping_count = 0
-                while not self.should_stop and ping_count < max_pings:
-                    ping_count += 1
-
-                    # Send ping
-                    ping_msg = {"type": "ping"}
-                    await websocket.send(json.dumps(ping_msg))
-                    self.request_count += 1
-                    logging.debug(f"Sent ping #{ping_count} to channel {self.channel_id}")
-
-                    # Read incoming messages and respond to Pusher pings
-                    try:
-                        msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                        data = json.loads(msg) if isinstance(msg, str) else {}
-                        msg_type = data.get("type", "")
-                        if msg_type in ("pusher:ping", "ping"):
-                            pong_msg = {"type": "pusher:pong" if "pusher" in msg_type else "pong"}
-                            await websocket.send(json.dumps(pong_msg))
-                    except asyncio.TimeoutError:
-                        pass
-                    except Exception:
-                        pass
-
-                    # Wait between pings (12-17 seconds)
-                    sleep_time = 12 + random.randint(1, 5)
-                    await asyncio.sleep(sleep_time)
-
-                logging.debug(f"WebSocket worker completed for channel {self.channel_id}")
-
-        except websockets.exceptions.ConnectionClosed:
-            logging.debug("WebSocket connection closed")
-        except Exception as e:
-            logging.error(f"WebSocket error: {e}")
-            traceback.print_exc()
-
-
-
-    def configure_proxies(self, proxy_type, proxy_address):
-        try:
-            parts = proxy_address.split(':')
-            
-            if len(parts) < 2:
-                logging.error(f"Invalid proxy format: {proxy_address}")
-                return {}
-                
-            host = parts[0]
-            port = parts[1]
-            
-            if len(parts) >= 3:
-                credentials = ':'.join(parts[2:])
-                credentials += '@'
-            else:
-                credentials = ""
-            
-            if proxy_type.lower() in ["socks4", "socks5"]:
-                return {
-                    "http": f"{proxy_type}://{credentials}{host}:{port}",
-                    "https": f"{proxy_type}://{credentials}{host}:{port}"
-                }
-            else:
-                return {
-                    "http": f"http://{credentials}{host}:{port}",
-                    "https": f"http://{credentials}{host}:{port}"
-                }
-        except Exception as e:
-            logging.error(f"Error configuring proxy {proxy_address}: {e}")
-            return {}
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass
 
     def main(self):
-        self.update_status('starting', 'Starting bot...', startup_progress=0)
-        start = datetime.datetime.now()
-        
-        # Initialize channel ID first
-        self.update_status('starting', 'Getting channel information...', startup_progress=10)
-        self.channel_id = self.get_channel_id()
-        if not self.channel_id:
-            # Use fallback mode - try to continue with WebSocket-only approach
-            logging.warning(f"Could not get channel ID for {self.channel_name}, trying fallback mode...")
-            self.update_status('starting', 'Channel ID unavailable, using fallback mode...', startup_progress=15)
-            
-            # Try some common test IDs or generate a fallback
-            fallback_ids = {
-                'grndpagaming': '123456',  # Common test channels with fallback IDs
-                'trainwreckstv': '234567',
-                'xqc': '345678',
-                'adinross': '456789',
-                'pokimane': '567890'
-            }
-            
-            self.channel_id = fallback_ids.get(self.channel_name.lower(), '999999')
-            logging.info(f"Using fallback channel ID: {self.channel_id} for {self.channel_name}")
-            self.update_status('starting', f'Using fallback mode (ID: {self.channel_id})...', startup_progress=20)
-        
-        proxies = self.get_proxies()
-        logging.debug(f"Proxies: {proxies}")
-        
-        if not proxies:
-            self.update_status('error', 'No proxies available. Stopping bot.')
-            self.should_stop = True
+        if self._stop.is_set():
+            self._finish_sessions()
+            self._update_status("stopped", "YouTube sessions stopped.")
+            return
+        self._update_status("starting", "Launching Chromium for YouTube playback...", 10)
+        try:
+            asyncio.run(self._run())
+            if self._stop.is_set():
+                self._update_status("stopped", "YouTube sessions stopped.", 0)
+            elif self.status["state"] != "error":
+                self._update_status("stopped", "All YouTube sessions have ended.", 0)
+        except Exception as exc:
+            logger.error("Unable to start YouTube sessions: %s", type(exc).__name__)
+            message = ("Chromium is not installed. Run: python -m playwright install chromium"
+                       if "executable doesn't exist" in str(exc).lower()
+                       else "Could not launch Chromium. Check the browser installation and system dependencies.")
+            if self._stop.is_set():
+                self._update_status("stopped", "YouTube sessions stopped.", 0)
+            else:
+                self._update_status("error", message, 0)
+        finally:
+            self._finish_sessions()
+            with self._lock:
+                self._loop = None
+                self._async_stop = None
+
+    async def _run(self):
+        from playwright.async_api import async_playwright
+
+        with self._lock:
+            self._loop = asyncio.get_running_loop()
+            self._async_stop = asyncio.Event()
+            if self._stop.is_set():
+                self._async_stop.set()
+        if self._stop.is_set():
             return
 
-        # Preload stream URL to avoid rate limiting (still useful for backup)
-        self.update_status('starting', 'Getting stream URL...', startup_progress=50)
-        stream_url = self.get_url()
-        if not stream_url:
-            self.update_status('warning', 'Could not get initial stream URL, will use WebSocket only')
-            stream_url = ""  # Set empty string as fallback
-        
-        # Initialize all_proxies with the preloaded URL
-        self.all_proxies = [{'proxy': p, 'time': time.time(), 'url': stream_url} for p in proxies]
-        
-        self.processes = []
-        
-        self.update_status('running', 'Bot is now running with WebSocket connections', 
-                          proxy_count=len(self.all_proxies), 
-                          startup_progress=100)
-        
-        try:
-            while not self.should_stop:
-                if len(self.all_proxies) == 0:
-                    console.print("[bold red]No proxies available. Stopping bot.[/bold red]")
-                    break
-
-                elapsed_seconds = (datetime.datetime.now() - start).total_seconds()
-
-                # Try to spawn threads up to the limit, but don't block
-                # This allows us to check self.should_stop frequently
-                for i in range(0, int(self.nb_of_threads)):
-                    if self.should_stop:
-                        break
-                        
-                    # Use non-blocking acquire
-                    if self.thread_semaphore.acquire(blocking=False):
-                        if len(self.all_proxies) > 0:
-                            try:
-                                proxy_data = self.all_proxies[random.randrange(len(self.all_proxies))]
-                                threaded = Thread(target=self.open_url, args=(proxy_data,))
-                                self.processes.append(threaded)
-                                threaded.daemon = True
-                                threaded.start()
-                            except Exception as e:
-                                logging.error(f"Error starting thread: {e}")
-                                self.thread_semaphore.release()
-                        else:
-                            self.thread_semaphore.release()
-                    else:
-                        # If we can't acquire, we are at max threads
-                        break
-
-                if elapsed_seconds >= 300 and self.proxy_imported == False:
-                    # Refresh the proxies after 300 seconds (5 minutes)
-                    start = datetime.datetime.now()
-                    self.proxyrefreshed = False
-                    proxies = self.get_proxies()
-                    if proxies:
-                        # Update all_proxies with new proxies
-                        self.all_proxies = [{'proxy': p, 'time': time.time(), 'url': ""} for p in proxies]
-                        logging.debug(f"Proxies refreshed: {len(self.all_proxies)} proxies available")
-                        elapsed_seconds = 0
-
-                # Prevent CPU hogging
-                time.sleep(1)
-                
-        except Exception as e:
-            logging.error(f"Critical error in main loop: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
-            self.should_stop = True
-            
-        finally:
-            logging.debug("Stopping main loop and cleaning up")
-            # Relâcher tous les sémaphores restants pour éviter les blocages
-            for _ in range(self.nb_of_threads):
+        async with async_playwright() as playwright:
+            options = {"headless": True, "args": ["--mute-audio", "--autoplay-policy=no-user-gesture-required"]}
+            if os.environ.get("CHROMIUM_PATH"):
+                options["executable_path"] = os.environ["CHROMIUM_PATH"]
+            # Launching Chromium can take a while; allow Stop to interrupt startup.
+            launch_task = asyncio.create_task(playwright.chromium.launch(**options))
+            stop_during_launch = asyncio.create_task(self._async_stop.wait())
+            try:
+                done, _ = await asyncio.wait((launch_task, stop_during_launch), return_when=asyncio.FIRST_COMPLETED)
+                if stop_during_launch in done and launch_task not in done:
+                    launch_task.cancel()
+                    await asyncio.gather(launch_task, return_exceptions=True)
+                    return
+                browser = await launch_task
+            finally:
+                stop_during_launch.cancel()
+                await asyncio.gather(stop_during_launch, return_exceptions=True)
+            try:
+                if self._stop.is_set():
+                    return
+                self._update_status("starting", "Opening YouTube players...", 30)
+                workers = [asyncio.create_task(self._worker(browser, i)) for i in range(self.nb_of_threads)]
+                all_workers = asyncio.gather(*workers, return_exceptions=True)
+                stop_waiter = asyncio.create_task(self._async_stop.wait())
                 try:
-                    self.thread_semaphore.release()
-                except ValueError:
-                    pass
-            
-            self.stop()
+                    done, _ = await asyncio.wait((all_workers, stop_waiter), return_when=asyncio.FIRST_COMPLETED)
+                    if stop_waiter in done:
+                        for worker in workers:
+                            worker.cancel()
+                    await all_workers
+                finally:
+                    stop_waiter.cancel()
+                    await asyncio.gather(stop_waiter, return_exceptions=True)
+            finally:
+                await browser.close()
 
-        for t in self.processes:
-            if t.is_alive():
-                t.join(timeout=0.1)
-        console.print("[bold red]Bot main loop ended[/bold red]")
+    async def _worker(self, browser, index):
+        with self._lock:
+            self.active_threads += 1
+        failures = 0
+        startup_attempts = 0
+        has_played = False
+        attempted_proxies = set()
+        startup_limit = min(MAX_STARTUP_PROXY_ATTEMPTS, len(self.all_proxies))
+        try:
+            # Stagger browser creation to avoid launching every page at once.
+            try:
+                await asyncio.wait_for(self._async_stop.wait(), timeout=min(index * 0.2, 10) or 0.001)
+                return
+            except asyncio.TimeoutError:
+                pass
+            while not self._stop.is_set():
+                context = None
+                proxy = None
+                stage = "browser_setup"
+                retry_delay = None
+                try:
+                    if startup_limit and len(attempted_proxies) >= startup_limit:
+                        attempted_proxies.clear()
+                    proxy_index, proxy = self._next_proxy(attempted_proxies)
+                    if proxy_index is not None:
+                        attempted_proxies.add(proxy_index)
+                    if not has_played:
+                        startup_attempts += 1
+                    with self._lock:
+                        self.request_count += 1
+                    options = {"locale": "en-US"}
+                    if proxy:
+                        options["proxy"] = proxy
+                        stage = "proxy_setup"
+                    context = await browser.new_context(**options)
+                    page = await context.new_page()
+                    stage = "navigation"
+                    response = await page.goto(self.channel_url, wait_until="domcontentloaded", timeout=self.timeout)
+                    if response and response.status >= 400:
+                        raise http_playback_failure(response.status)
+                    # Consent dialogs can occur in some regions. This does not bypass sign-in or access restrictions.
+                    if "consent.youtube.com" in page.url:
+                        button = page.get_by_role("button", name="Reject all")
+                        if await button.count():
+                            await button.first.click(timeout=self.timeout)
+                    stage = "player"
+                    await page.wait_for_selector("video", state="attached", timeout=self.timeout)
+                    stage = "playback"
+                    await page.evaluate("""() => {
+                        const video = document.querySelector('video');
+                        video.muted = true;
+                        const promise = video.play();
+                        if (promise) promise.catch(() => {});
+                    }""")
+                    await page.wait_for_function(
+                        "() => { const v = document.querySelector('video'); return v && !v.paused && !v.ended && v.readyState >= 2; }",
+                        timeout=self.timeout,
+                    )
+                    try:
+                        resolved_id = youtube_video_id(page.url)
+                        if resolved_id:
+                            with self._lock:
+                                self.video_id = resolved_id
+                    except ValueError:
+                        pass
+                    with self._lock:
+                        if self._stop.is_set():
+                            return
+                        self._set_session_state(index, "playing")
+                        self.successful_sessions += 1
+                        self._update_status("running", "YouTube playback is active. Counts are determined by YouTube.", 100)
+                    failures = 0
+                    has_played = True
+                    attempted_proxies.clear()
+                    stalled = 0
+                    while not self._stop.is_set():
+                        try:
+                            await asyncio.wait_for(self._async_stop.wait(), timeout=PLAYER_CHECK_INTERVAL)
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+                        state = await page.evaluate("""() => {
+                            const v = document.querySelector('video');
+                            if (!v) return {missing: true};
+                            if (v.paused && !v.ended) { const p = v.play(); if (p) p.catch(() => {}); }
+                            return {ended: v.ended, error: !!v.error, playing: !v.paused && v.readyState >= 2};
+                        }""")
+                        if state.get("ended"):
+                            with self._lock:
+                                self._set_session_state(index, "ended")
+                                if self.active_connections == 0 and not self._stop.is_set():
+                                    self._update_status("warning", "A player ended. Waiting for any remaining sessions.", 100)
+                            return
+                        if state.get("error"):
+                            raise PlaybackFailure(
+                                "player_error",
+                                "The player reported a media error. Check the stream, network and any proxy.",
+                            )
+                        now_playing = bool(state.get("playing")) and not state.get("missing")
+                        with self._lock:
+                            previous = self._session_states[index]
+                            self._set_session_state(index, "playing" if now_playing else "buffering")
+                            if not self._stop.is_set() and previous != self._session_states[index]:
+                                if now_playing:
+                                    self._update_status(
+                                        "running", "YouTube playback is active. Counts are determined by YouTube.", 100,
+                                    )
+                                elif self.active_connections == 0:
+                                    self._update_status(
+                                        "warning", "Playback is buffering or temporarily unavailable. Waiting for recovery.", 100,
+                                    )
+                        stalled = 0 if now_playing else stalled + 1
+                        # Player elements can briefly disappear or buffer while the page changes.
+                        # Do not count them as playing, but give them time to recover before restarting.
+                        if stalled >= PLAYER_STALL_CHECKS:
+                            raise PlaybackFailure(
+                                "player_stalled",
+                                "The player could not resume. Check the stream, connection, resources and any proxy.",
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failures += 1
+                    code, message = diagnose_playback_error(exc, stage, proxy is not None)
+                    logger.warning("YouTube session failed during %s (%s)", stage, code)
+                    # Startup proxy failover is bounded and does not imply reconnecting
+                    # after playback has begun. A configured proxy is never bypassed.
+                    if not has_played and proxy is not None and startup_attempts < startup_limit:
+                        retry_delay = STARTUP_PROXY_RETRY_DELAY
+                        suffix = f" Trying another proxy ({startup_attempts + 1}/{startup_limit})."
+                    elif self.reconnect:
+                        retry_delay = min(RECONNECT_BASE_DELAY * 2 ** min(failures - 1, 4), MAX_RECONNECT_DELAY)
+                        suffix = " Automatic retry is enabled."
+                    else:
+                        suffix = ""
+                    with self._lock:
+                        self._set_session_state(index, "retrying" if retry_delay is not None else "failed")
+                        self.failed_attempts += 1
+                        self.last_error = {"code": code, "message": message}
+                        if self.active_connections == 0 and not self._stop.is_set():
+                            self._update_status(
+                                "warning" if retry_delay is not None else "error",
+                                message + suffix, 100, error_code=code,
+                            )
+                    if retry_delay is None:
+                        return
+                finally:
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+                if retry_delay is not None and not self._stop.is_set():
+                    try:
+                        await asyncio.wait_for(self._async_stop.wait(), timeout=retry_delay)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            with self._lock:
+                if self._session_states[index] not in {"ended", "failed"}:
+                    self._set_session_state(index, "stopped")
+                self.active_threads -= 1

@@ -7,108 +7,53 @@ import WebSocketService, {
 } from "@/services/WebSocketService";
 
 export function useWebSocketBot() {
-  const [isConnected, setIsConnected] = useState(false);
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [stats, setStats] = useState<BotStats | null>(null);
-  const [error, setError] = useState<string>("");
+  const [error, setError] = useState("");
   const wsRef = useRef<WebSocketService | null>(null);
 
   useEffect(() => {
-    // Créer le service WebSocket
     const ws = new WebSocketService({
       onConnect: () => {
-        setIsConnected(true);
         setError("");
-        // Demander les stats immédiatement après connexion
         ws.getStats();
       },
-      onDisconnect: () => {
-        setIsConnected(false);
-      },
-      onStatsUpdate: (newStats) => {
-        setStats(newStats);
-      },
-      onBotStarted: (data) => {
-        ws.getStats();
-      },
-      onBotStopped: (data) => {
-        ws.getStats();
-      },
-      onBotError: (errorMsg) => {
-        setError(errorMsg);
-      },
-      onStatusChange: (newStatus) => {
-        setStatus(newStatus);
-      },
+      onStatsUpdate: setStats,
+      onBotStarted: () => ws.getStats(),
+      onBotStopped: () => ws.getStats(),
+      onBotError: setError,
+      onStatusChange: setStatus,
     });
-
     wsRef.current = ws;
-
-    // Se connecter automatiquement
     ws.connect();
-
-    // Demander les stats régulièrement
-    const statsInterval = setInterval(() => {
-      if (ws.isConnected()) {
-        ws.getStats();
-      }
-    }, 2000);
-
-    // Cleanup
+    const interval = setInterval(() => ws.getStats(), 2000);
     return () => {
-      clearInterval(statsInterval);
+      clearInterval(interval);
       ws.disconnect();
+      wsRef.current = null;
     };
   }, []);
 
   const startBot = useCallback(async (config: BotConfig) => {
-    if (!wsRef.current) {
-      throw new Error("WebSocket service not initialized");
-    }
-
-    try {
-      await wsRef.current.startBot(config);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start bot");
-      throw err;
-    }
+    if (!wsRef.current) throw new Error("Backend is not connected.");
+    setError("");
+    await wsRef.current.startBot(config);
+    wsRef.current.getStats();
   }, []);
-
-  const stopBot = useCallback(() => {
-    if (!wsRef.current) {
-      throw new Error("WebSocket service not initialized");
-    }
-
-    try {
-      wsRef.current.stopBot();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to stop bot");
-      throw err;
-    }
+  const stopBot = useCallback(async () => {
+    if (!wsRef.current) throw new Error("Backend is not connected.");
+    setError("");
+    await wsRef.current.stopBot();
+    wsRef.current.getStats();
   }, []);
-
-  const reconnect = useCallback(async () => {
-    if (wsRef.current) {
-      await wsRef.current.connect();
-    }
-  }, []);
-
-  const getCurrentUrl = useCallback(() => {
-    return wsRef.current?.getCurrentUrl() || "";
-  }, []);
+  const reconnect = useCallback(() => wsRef.current?.connect(), []);
 
   return {
-    // Connection state
-    isConnected,
+    isConnected: status === "connected",
     status,
-    error,
-    currentUrl: getCurrentUrl(),
-
-    // Bot stats
     stats,
-    isRunning: stats?.is_running || false,
-
-    // Actions
+    error,
+    isRunning: stats?.is_running ?? false,
     startBot,
     stopBot,
     reconnect,

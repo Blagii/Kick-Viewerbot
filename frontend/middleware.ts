@@ -1,50 +1,12 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
-
-const PROTECTED_PATHS = ["/", "/dashboard", "/app", "/metrics"];
-const AUTH_COOKIE_NAMES = (
-  process.env.NEXT_PUBLIC_AUTH_COOKIE_NAMES || "access_token"
-)
-  .split(",")
-  .map((name) => name.trim())
-  .filter(Boolean);
-
-function isProtectedPath(pathname: string): boolean {
-  return PROTECTED_PATHS.some(
-    (protectedPath) =>
-      pathname === protectedPath || pathname.startsWith(`${protectedPath}/`)
-  );
-}
-
+// These routes belonged to the old Kick/Patreon service and must not send
+// users to that unrelated authentication backend in the YouTube dashboard.
 export function middleware(request: NextRequest) {
-  if (process.env.NODE_ENV === "development") {
-    return NextResponse.next();
-  }
-
-  const { pathname } = request.nextUrl;
-
-  if (pathname === "/success" || pathname === "/error") {
-    return NextResponse.next();
-  }
-
-  if (!isProtectedPath(pathname)) {
-    return NextResponse.next();
-  }
-
-  const hasRequiredCookie =
-    AUTH_COOKIE_NAMES.length === 0 ||
-    AUTH_COOKIE_NAMES.some((cookieName) => request.cookies.has(cookieName));
-
-  if (!hasRequiredCookie) {
-    const loginUrl = new URL("/login", request.url);
-    loginUrl.searchParams.set("redirect", pathname);
-    return NextResponse.redirect(loginUrl);
-  }
-
-  return NextResponse.next();
+  return NextResponse.redirect(new URL("/", request.url));
 }
 
 export const config = {
-  matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/login", "/register", "/success", "/error"],
 };
