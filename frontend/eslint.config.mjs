@@ -88,6 +88,8 @@ export default defineConfig([globalIgnores([
     rules: {
         "no-console": "warn",
         "react/prop-types": "off",
+        // Next.js supports these attributes on styled-jsx <style> elements.
+        "react/no-unknown-property": ["error", { ignore: ["jsx", "global"] }],
         "react/jsx-uses-react": "off",
         "react/react-in-jsx-scope": "off",
         "react-hooks/exhaustive-deps": "off",

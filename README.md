@@ -1,110 +1,102 @@
-# Kick Viewer Bot
+# YouTube Viewer Bot
 
-A powerful web application for generating Kick views using proxy rotation technology. Built with a **Flask/SocketIO** backend and **Next.js** frontend communicating via WebSocket.
+A local dashboard for opening and monitoring YouTube playback sessions. This version replaces the original Kick-specific viewer protocol with isolated, headless Chromium contexts using Playwright. It supports YouTube live-stream/video links and channel handles, optional proxy lists, automatic reconnection, and live playback status.
 
-## Warning
-
-⚠️ **EDUCATIONAL PURPOSE ONLY** ⚠️
-
-This software is provided strictly for educational and research purposes. Using this tool to manipulate viewing metrics may violate Kick's Terms of Service and applicable laws. The developers assume no responsibility for misuse of this software.
-
-## Table of Contents
-
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Development Setup](#development-setup)
-- [How to use with macOS](#how-to-use-with-macos)
-- [Screenshots](#screenshots)
-- [License](#license)
-
-## Features
-
-- 🚀 High-performance multi-threading system supporting up to 1000 concurrent connections
-- 🔄 Intelligent proxy rotation with automatic failover mechanisms
-- 🌐 Comprehensive proxy protocol support (HTTP, SOCKS4, SOCKS5)
-- 🌐 **Proxy-tunneled WebSocket connections** — each viewer appears from a unique IP
-- 📊 Real-time analytics dashboard with performance metrics
-- 📱 Responsive and intuitive web interface
-- 🔥 **Stability Mode** — long-lived connections with auto-reconnection
-- 🔔 **Automatic update notifications** when a new version is available
-- ⚙️ Advanced configuration options for power users
+> **Important:** YouTube decides which activity counts as a view or concurrent viewer and may filter automated traffic. Opening playback sessions **does not guarantee views or an increase in the counter**. Automating or manipulating engagement can violate YouTube's terms. Use responsibly and only where permitted.
 
 ## Requirements
 
-- Python 3.9+
-- Node.js 18+
-- Modern web browser with JavaScript enabled
-- Stable internet connection
-- (Optional) Custom proxy list for enhanced performance
+- Python 3.9 or newer and Node.js 18.18 or newer
+- A supported desktop OS and internet access to YouTube
+- Playwright's Chromium browser (installed below). Linux may also need Playwright's system dependencies; see [Playwright installation](https://playwright.dev/python/docs/intro#installing-playwright).
+- Resources and bandwidth for each browser session; start with one or two sessions.
 
-## 💻 Installation
+## Install
 
-1. Download the latest release executable from the [releases page](https://github.com/H1B0B0/Kick-Viewerbot/releases)
-2. Run `KickViewerBOT` — **no admin privileges required**
-3. Configure your viewing preferences and proxy settings
-4. Start the bot and monitor real-time statistics
+From the project directory:
 
-## 🛠️ Development Setup
+```sh
+python -m venv .venv
+# macOS/Linux:
+source .venv/bin/activate
+# Windows PowerShell instead: .venv\Scripts\Activate.ps1
 
-### 1. Clone & install dependencies
-
-```shell
-git clone https://github.com/H1B0B0/Kick-Viewerbot.git
-cd Kick-Viewerbot
-```
-
-**Backend (Python):**
-
-```shell
 pip install -r requirements.txt
-```
+python -m playwright install chromium
 
-**Frontend (Node.js):**
-
-```shell
 cd frontend
-npm install
+npm ci
+cd ..
 ```
 
-### 2. Run the development servers
+On Linux, if Chromium reports missing system libraries, install the required packages with `python -m playwright install-deps chromium` (this may require administrator privileges). If you already have a compatible Chromium, `CHROMIUM_PATH` can optionally point to its executable instead of the downloaded browser.
 
-You need **two terminals** running simultaneously:
+## Run
 
-**Terminal 1 — Backend:**
+Use two terminals, keeping both processes running:
 
-```shell
-python ./backend/main.py
+**Backend:**
+
+```sh
+# Activate the virtual environment first
+python backend/main.py
 ```
 
-**Terminal 2 — Frontend:**
+**Frontend:**
 
-```shell
+```sh
 cd frontend
 npm run dev
 ```
 
-The frontend dev server runs on `http://localhost:3000` and communicates with the backend via WebSocket.
+Open <http://localhost:3000>. Paste a YouTube watch/live/share URL, a case-sensitive 11-character video ID, or a channel handle such as `@YouTube`; select the number of sessions and press **Start sessions**. An 11-character bare input is treated as a video ID, so prefix a channel handle with `@`. Channel targets point to the channel's `/live` page; a video link is generally more reliable.
 
-## How to use with macOS
+The status panel reports startup, playback, retries, and errors. **Playing sessions** counts browser players that are playing; **Playback attempts** counts attempts, not verified YouTube views. Stop also works during startup and retrying. Private, age-restricted, offline, unavailable or sign-in-only streams may not play. No attempt is made to bypass those restrictions.
 
-1. Download the macOS build from the [releases page](https://github.com/H1B0B0/Kick-Viewerbot/releases)
-   ![macOS version](./images/macos_file.png)
-2. When launching, you may encounter a security warning
-   ![macOS block message](./images/macos_block.png)
-3. Navigate to `System Settings` → `Privacy & Security`. Click `Open Anyway`
-   ![Enable macOS application](images/enable_macos.png)
-4. Confirm by clicking `Open Anyway` in the dialog
-   ![Execute the app](./images/use_macos.png)
-5. The application will start. Configure your settings and enjoy 🚀
+The frontend proxies `/socket.io/` and `/api/youtube/` to `http://127.0.0.1:8765` on the server. To use a different backend port, start the backend with `--port PORT` and set `BACKEND_URL=http://127.0.0.1:PORT` **before starting the frontend**. The backend binds to localhost by default. It has no authentication, so do not expose it to untrusted networks. For development behind a trusted preview proxy, the backend can be started with `--host 0.0.0.0`.
 
-## 📸 Screenshots
+## Optional: YouTube live viewer count
 
-<img width="1512" alt="Dashboard Overview" src="https://github.com/user-attachments/assets/439dde39-6370-45d5-8ec1-3587fd86c98b" />
-<img width="1512" alt="Channel Configuration" src="https://github.com/user-attachments/assets/654e0e82-c828-4c30-a120-4488ba44b799" />
-<img width="1512" alt="Advanced Settings" src="https://github.com/user-attachments/assets/066615f5-09fc-4077-b83c-c1e553de3f7b" />
-<img width="1512" alt="Performance Analytics" src="https://github.com/user-attachments/assets/6392e0e0-cda7-49e7-9969-41753d8c6c76" />
+YouTube's official Data API v3 is used only for the **Live viewers** card. Create an API key with the YouTube Data API v3 enabled in Google Cloud and set `YOUTUBE_API_KEY` in the backend's environment before starting it:
+
+```sh
+# macOS/Linux
+export YOUTUBE_API_KEY="your-api-key"
+python backend/main.py
+```
+
+In Windows PowerShell, use `$env:YOUTUBE_API_KEY="your-api-key"` before launching the backend. The key stays on the backend and is not sent to the browser. Without a key, when quota/access fails, or when YouTube does not publish a concurrent count, the card displays `—` and explains why; it does not invent a zero. A video link is needed for the count; for a channel handle, the app uses the video ID once the player resolves it. The dashboard polls no more often than once per minute per selected target.
+
+## Proxies
+
+The proxy file is optional. Without one, all sessions connect directly. Upload a UTF-8 `.txt` file with one proxy per line, for example:
+
+```text
+127.0.0.1:8080
+http://user:password@proxy.example:8080
+socks4://proxy.example:1080
+socks5://proxy.example:1080
+```
+
+Explicit schemes override the selected default; `Auto / HTTP` assumes HTTP for entries without a scheme. HTTP proxy authentication is supported; Chromium does not support authenticated SOCKS proxies. Empty lines and `#` comments are ignored. Invalid entries are rejected with their line number. Proxies are assigned round-robin; if you provide fewer proxies than sessions they are reused. A failed proxy is **not** silently replaced by a direct connection. The uploaded text stays in backend memory and is not written to disk; only use a backend and proxies you trust. The file size limit is 1 MB.
+
+## Testing
+
+```sh
+pip install pytest
+python -m pytest
+cd frontend
+npm run lint
+npm exec -- tsc --noEmit
+npm run build
+```
+
+The unit tests mock YouTube and browser calls, so they run without a YouTube connection. An optional real-browser smoke test uses a local synthetic video: set `TEST_CHROMIUM_PATH` to a compatible Chromium executable before running `python -m pytest tests/test_playwright_local.py`. Actual YouTube playback depends on availability, regional restrictions, Chromium, and the network.
+
+## Migration notes
+
+The old Kick chat bot, Kick account/Patreon service, stability-mode claims, Kick executable builds, and Kick update feed are **not** YouTube features and are not used by the new dashboard. Some old files remain for reference; previous Kick releases are not YouTube builds. There is currently no YouTube chat integration or packaged executable; run from source using the steps above.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for detailed terms and conditions.
+MIT; see [LICENSE.txt](LICENSE.txt).
