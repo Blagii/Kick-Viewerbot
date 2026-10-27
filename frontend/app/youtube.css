@@ -465,6 +465,10 @@ select {
   font-size: 11px;
   padding: 0;
 }
+.proxy-retry-hint {
+  margin-top: 12px;
+  line-height: 1.5;
+}
 .reconnect-setting {
   display: flex;
   align-items: center;
@@ -655,6 +659,13 @@ select {
   color: #999ba5;
   font-size: 11px;
   line-height: 1.55;
+}
+.status-detail {
+  margin: -8px 0 16px;
+  color: #c4a9ab;
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 .progress-track {
   height: 4px;

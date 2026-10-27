@@ -388,6 +388,10 @@ export default function Dashboard() {
                   </p>
                 </div>
               </div>
+              <p className="field-hint proxy-retry-hint">
+                With a proxy list, up to 5 different proxies are tried per
+                session at startup. No direct fallback.
+              </p>
 
               <label className="reconnect-setting" htmlFor="reconnect">
                 <span className="reconnect-icon">
@@ -395,7 +399,7 @@ export default function Dashboard() {
                 </span>
                 <span>
                   <strong>Automatic reconnection</strong>
-                  <small>Retry when a player disconnects.</small>
+                  <small>Keep retrying startup or playback failures.</small>
                 </span>
                 <input
                   id="reconnect"
@@ -465,6 +469,18 @@ export default function Dashboard() {
                   </span>
                 </div>
                 <p>{statusMessage}</p>
+                {botStatus?.error_code && (
+                  <div className="status-detail">
+                    Code: {botStatus.error_code}
+                  </div>
+                )}
+                {state === "running" && stats?.last_error && (
+                  <div className="status-detail">
+                    Last issue ({stats.failed_attempts} failed{" "}
+                    {stats.failed_attempts === 1 ? "attempt" : "attempts"}):{" "}
+                    {stats.last_error.message}
+                  </div>
+                )}
                 {isRunning && (
                   <div className="progress-track">
                     <span

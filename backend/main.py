@@ -93,9 +93,11 @@ class BotManager:
             self.last_net_io, self.last_net_io_time = net, now
             details = self.bot.snapshot() if self.bot else {
                 "active_threads": 0, "active_connections": 0, "request_count": 0,
-                "successful_sessions": 0, "total_proxies": 0, "video_id": None,
+                "successful_sessions": 0, "failed_attempts": 0, "last_error": None,
+                "total_proxies": 0, "video_id": None,
                 "status": {"state": "stopped", "message": "Ready to start YouTube playback.",
-                           "proxy_count": 0, "proxy_loading_progress": 0, "startup_progress": 0},
+                           "proxy_count": 0, "proxy_loading_progress": 0, "startup_progress": 0,
+                           "error_code": None},
             }
             return {"is_running": self.is_running, "channel_name": self.last_channel,
                     "config": dict(self.config), "system_metrics": system_metrics, **details}

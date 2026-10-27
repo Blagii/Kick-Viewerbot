@@ -78,7 +78,16 @@ socks4://proxy.example:1080
 socks5://proxy.example:1080
 ```
 
-Explicit schemes override the selected default; `Auto / HTTP` assumes HTTP for entries without a scheme. HTTP proxy authentication is supported; Chromium does not support authenticated SOCKS proxies. Empty lines and `#` comments are ignored. Invalid entries are rejected with their line number. Proxies are assigned round-robin; if you provide fewer proxies than sessions they are reused. A failed proxy is **not** silently replaced by a direct connection. The uploaded text stays in backend memory and is not written to disk; only use a backend and proxies you trust. The file size limit is 1 MB.
+Explicit schemes override the selected default; `Auto / HTTP` assumes HTTP for entries without a scheme. HTTP proxy authentication is supported; Chromium does not support authenticated SOCKS proxies. Empty lines and `#` comments are ignored; exact duplicate entries are removed. Invalid entries are rejected with their line number.
+
+Proxies are assigned round-robin across sessions; if there are fewer proxies than sessions, they are reused. During initial startup, each session tries up to **five distinct proxies** from the list if earlier attempts fail, even if automatic reconnection is off. Once playback has started, retrying a failure depends on the automatic reconnection setting. When enabled, it also continues retrying startup failures with a backoff after those initial attempts. A configured proxy is **never** silently replaced by a direct connection. The uploaded text stays in backend memory and is not written to disk; only use a backend and proxies you trust. The file size limit is 1 MB.
+
+## Troubleshooting playback
+
+- First test **one session without a proxy** using a public, currently available video URL on a machine with direct access to YouTube. A hosted preview or restricted network may be unable to reach YouTube or external proxies at all.
+- If direct playback works but a proxy list fails, check that the proxies are reachable, support HTTPS tunneling, and use the correct protocol and credentials. Public/free lists often contain dead or blocked entries; loading a list does not verify that its proxies work.
+- The status panel distinguishes common proxy, DNS, timeout, HTTP and player failures where possible. It does not reveal proxy credentials or raw browser errors. A timeout can also occur while a player loads slowly; try increasing the timeout.
+- If the player cannot start even without a proxy, confirm that Chromium and its system dependencies are installed and that the stream does not require sign-in or have regional, age or availability restrictions. Not every YouTube player failure exposes a specific cause.
 
 ## Testing
 

@@ -24,6 +24,8 @@ export interface BotStats {
   total_proxies: number;
   request_count: number;
   successful_sessions: number;
+  failed_attempts: number;
+  last_error: { code: string; message: string } | null;
   config: {
     threads?: number;
     timeout?: number;
@@ -36,6 +38,7 @@ export interface BotStats {
     proxy_count: number;
     proxy_loading_progress: number;
     startup_progress: number;
+    error_code: string | null;
   };
   system_metrics: {
     cpu: number;
