@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+import backend.api.viewer_bot as viewer_bot
 from backend.api.viewer_bot import ViewerBot
 
 
@@ -115,3 +116,70 @@ def test_real_browser_fails_over_to_local_proxy(monkeypatch):
         proxy.server_close()
     assert not thread.is_alive()
     assert bot.snapshot()["status"]["state"] == "stopped"
+
+
+@pytest.mark.skipif(not os.getenv("TEST_CHROMIUM_PATH"), reason="Set TEST_CHROMIUM_PATH to run a real-browser smoke test")
+def test_ten_real_players_recover_after_a_brief_player_replacement(monkeypatch):
+    """A local synthetic player briefly disappears, then resumes without reconnecting."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"""<!doctype html><video autoplay muted playsinline></video><script>
+                const canvas = document.createElement('canvas');
+                canvas.width = 160; canvas.height = 90;
+                const context = canvas.getContext('2d');
+                setInterval(() => { context.fillStyle = '#f33'; context.fillRect(0, 0, 160, 90); }, 50);
+                const stream = canvas.captureStream(15);
+                const original = document.querySelector('video');
+                original.srcObject = stream; original.play().catch(() => {});
+                setTimeout(() => {
+                    original.remove();
+                    setTimeout(() => {
+                        const replacement = document.createElement('video');
+                        replacement.autoplay = true; replacement.muted = true; replacement.playsInline = true;
+                        replacement.srcObject = stream; document.body.appendChild(replacement);
+                        replacement.play().catch(() => {});
+                    }, 350);
+                }, 1400);
+            </script>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    monkeypatch.setenv("CHROMIUM_PATH", os.environ["TEST_CHROMIUM_PATH"])
+    monkeypatch.setattr(viewer_bot, "PLAYER_CHECK_INTERVAL", 0.2)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bot = ViewerBot(10, "AbCDef12_-X", timeout=10000, reconnect=False)
+    bot.channel_url = f"http://127.0.0.1:{server.server_port}/"
+    thread = threading.Thread(target=bot.main, daemon=True)
+    thread.start()
+    saw_buffering = False
+    all_started_at = None
+    try:
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            snap = bot.snapshot()
+            assert sum(snap["session_counts"].values()) == 10
+            assert snap["session_counts"]["playing"] == snap["active_connections"]
+            assert snap["failed_attempts"] == 0, snap
+            saw_buffering |= snap["session_counts"]["buffering"] > 0
+            if snap["successful_sessions"] == 10 and all_started_at is None:
+                all_started_at = time.monotonic()
+            if all_started_at and time.monotonic() - all_started_at >= 3 and snap["active_connections"] == 10:
+                break
+            time.sleep(0.05)
+        snap = bot.snapshot()
+        assert saw_buffering, snap
+        assert snap["active_connections"] == 10 and snap["request_count"] == 10, snap
+        assert snap["failed_attempts"] == 0, snap
+    finally:
+        bot.stop()
+        thread.join(10)
+        server.shutdown()
+        server.server_close()
+    assert not thread.is_alive()
+    assert bot.snapshot()["session_counts"]["stopped"] == 10

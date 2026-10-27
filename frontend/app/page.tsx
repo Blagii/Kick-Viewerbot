@@ -115,6 +115,15 @@ export default function Dashboard() {
 
   const metrics = stats?.system_metrics;
   const warning = localError || error;
+  const sessionBreakdown = stats?.session_counts
+    ? [
+        { label: "Starting", count: stats.session_counts.starting },
+        { label: "Buffering", count: stats.session_counts.buffering },
+        { label: "Retrying", count: stats.session_counts.retrying },
+        { label: "Ended", count: stats.session_counts.ended },
+        { label: "Failed", count: stats.session_counts.failed },
+      ].filter((item) => item.count > 0)
+    : [];
 
   return (
     <div className="yt-app">
@@ -474,11 +483,25 @@ export default function Dashboard() {
                     Code: {botStatus.error_code}
                   </div>
                 )}
-                {state === "running" && stats?.last_error && (
-                  <div className="status-detail">
-                    Last issue ({stats.failed_attempts} failed{" "}
-                    {stats.failed_attempts === 1 ? "attempt" : "attempts"}):{" "}
-                    {stats.last_error.message}
+                {stats?.last_error &&
+                  !botStatus?.error_code &&
+                  (isRunning || (stats.session_counts?.failed ?? 0) > 0) && (
+                    <div className="status-detail">
+                      Last issue ({stats.failed_attempts} failed{" "}
+                      {stats.failed_attempts === 1 ? "attempt" : "attempts"}):{" "}
+                      {stats.last_error.message}
+                    </div>
+                  )}
+                {sessionBreakdown.length > 0 && (
+                  <div
+                    className="session-breakdown"
+                    aria-label="Session states"
+                  >
+                    {sessionBreakdown.map(({ label, count }) => (
+                      <span key={label}>
+                        <strong>{count}</strong> {label}
+                      </span>
+                    ))}
                   </div>
                 )}
                 {isRunning && (

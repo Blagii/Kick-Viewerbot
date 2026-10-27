@@ -44,6 +44,7 @@ class ScriptedPage:
 
     def __init__(self, script):
         self.script = script
+        self.monitor_checks = 0
 
     async def goto(self, *args, **kwargs):
         if self.script.get("goto_error"):
@@ -61,6 +62,11 @@ class ScriptedPage:
     async def evaluate(self, script):
         if "video.muted = true" in script:
             return None
+        results = self.script.get("monitor_results")
+        if results:
+            result = results[min(self.monitor_checks, len(results) - 1)]
+            self.monitor_checks += 1
+            return result
         return self.script.get("monitor_result", {"playing": True})
 
 
@@ -280,6 +286,91 @@ def test_reconnect_continues_after_startup_failover_budget(monkeypatch, fast_tim
         stop_and_join(bot, thread)
 
 
+def test_transient_missing_player_recovers_without_restarting(monkeypatch):
+    monkeypatch.setattr(viewer_bot, "PLAYER_CHECK_INTERVAL", 0.15)
+    browser = ScriptedBrowser([{"monitor_results": [{"missing": True}, {"playing": True}]}])
+    install_fake_playwright(monkeypatch, browser)
+    bot = ViewerBot(1, "AbCDef12_-X", reconnect=False)
+    thread = start_in_thread(bot)
+    try:
+        assert wait_until(lambda: bot.snapshot()["session_counts"]["buffering"] == 1)
+        snap = bot.snapshot()
+        assert snap["active_connections"] == 0
+        assert snap["status"]["state"] == "warning"
+        assert snap["failed_attempts"] == 0
+        assert wait_until(lambda: bot.snapshot()["active_connections"] == 1)
+        snap = bot.snapshot()
+        assert snap["session_counts"]["playing"] == 1
+        assert snap["session_counts"]["buffering"] == 0
+        assert snap["status"]["state"] == "running"
+        assert snap["request_count"] == snap["successful_sessions"] == 1
+        assert snap["failed_attempts"] == 0
+    finally:
+        stop_and_join(bot, thread)
+    assert bot.snapshot()["session_counts"]["stopped"] == 1
+
+
+def test_partial_buffering_keeps_other_players_running(monkeypatch):
+    monkeypatch.setattr(viewer_bot, "PLAYER_CHECK_INTERVAL", 0.15)
+    browser = ScriptedBrowser([{}, {"monitor_results": [{"missing": True}, {"playing": True}]}])
+    install_fake_playwright(monkeypatch, browser)
+    bot = ViewerBot(2, "AbCDef12_-X", reconnect=False)
+    thread = start_in_thread(bot)
+    try:
+        assert wait_until(lambda: bot.snapshot()["session_counts"]["buffering"] == 1)
+        snap = bot.snapshot()
+        assert snap["active_connections"] == snap["session_counts"]["playing"] == 1
+        assert snap["status"]["state"] == "running"
+        assert sum(snap["session_counts"].values()) == 2
+        assert wait_until(lambda: bot.snapshot()["active_connections"] == 2)
+        assert bot.snapshot()["failed_attempts"] == 0
+    finally:
+        stop_and_join(bot, thread)
+    assert bot.snapshot()["session_counts"]["stopped"] == 2
+
+
+def test_stop_before_launch_clears_starting_sessions():
+    bot = ViewerBot(3, "AbCDef12_-X", reconnect=False)
+    bot.stop()
+    bot.main()
+    snap = bot.snapshot()
+    assert snap["active_connections"] == 0
+    assert snap["session_counts"]["starting"] == 0
+    assert snap["session_counts"]["stopped"] == 3
+    assert sum(snap["session_counts"].values()) == 3
+
+
+def test_session_counts_explain_failed_and_ended_players(monkeypatch, fast_timing):
+    browser = ScriptedBrowser([{"monitor_result": {"ended": True}}, {"monitor_result": {"error": True}}])
+    install_fake_playwright(monkeypatch, browser)
+    bot = ViewerBot(2, "AbCDef12_-X", reconnect=False)
+    bot.main()
+    snap = bot.snapshot()
+    assert snap["active_connections"] == 0
+    assert snap["session_counts"]["ended"] == 1
+    assert snap["session_counts"]["failed"] == 1
+    assert sum(snap["session_counts"].values()) == 2
+    assert snap["last_error"]["code"] == "player_error"
+
+
+def test_reconnecting_session_is_reported_and_stop_interrupts_it(monkeypatch, fast_timing):
+    monkeypatch.setattr(viewer_bot, "RECONNECT_BASE_DELAY", 10)
+    monkeypatch.setattr(viewer_bot, "MAX_RECONNECT_DELAY", 10)
+    browser = ScriptedBrowser([{"monitor_result": {"missing": True}}])
+    install_fake_playwright(monkeypatch, browser)
+    bot = ViewerBot(1, "AbCDef12_-X", reconnect=True)
+    thread = start_in_thread(bot)
+    try:
+        assert wait_until(lambda: bot.snapshot()["session_counts"]["retrying"] == 1)
+        snap = bot.snapshot()
+        assert snap["active_connections"] == 0 and snap["failed_attempts"] == 1
+        assert snap["last_error"]["code"] == "player_stalled"
+        assert sum(snap["session_counts"].values()) == 1
+    finally:
+        stop_and_join(bot, thread)
+    assert bot.snapshot()["session_counts"]["stopped"] == 1
+
+
 def test_reconnect_off_does_not_retry_after_playback_failure(monkeypatch, fast_timing):
     browser = ScriptedBrowser([{"monitor_result": {"missing": True}}, {}])
     install_fake_playwright(monkeypatch, browser)
@@ -288,7 +379,7 @@ def test_reconnect_off_does_not_retry_after_playback_failure(monkeypatch, fast_t
     snap = bot.snapshot()
     assert snap["request_count"] == snap["successful_sessions"] == 1
     assert snap["status"]["state"] == "error"
-    assert snap["status"]["error_code"] == "player_stopped"
+    assert snap["status"]["error_code"] == "player_stalled"
     assert snap["active_connections"] == 0
 
 
@@ -301,7 +392,7 @@ def test_reconnect_on_retries_after_playback_failure_with_next_proxy(monkeypatch
         assert wait_until(lambda: bot.snapshot()["successful_sessions"] == 2)
         snap = bot.snapshot()
         assert snap["status"]["state"] == "running" and snap["active_connections"] == 1
-        assert snap["last_error"]["code"] == "player_stopped"
+        assert snap["last_error"]["code"] == "player_stalled"
         assert [o["proxy"]["server"] for o in browser.options] == ["http://host1:8080", "http://host2:8080"]
     finally:
         stop_and_join(bot, thread)
@@ -369,6 +460,8 @@ def test_safe_error_and_counters_are_delivered_by_socketio(monkeypatch, caplog):
         updates = [event for event in client.get_received() if event["name"] == "stats_update"]
         stats = updates[-1]["args"][0]
         assert not stats["is_running"] and stats["failed_attempts"] == 1
+        assert stats["session_counts"]["failed"] == 1
+        assert stats["session_counts"]["playing"] == stats["active_connections"] == 0
         assert stats["status"]["error_code"] == stats["last_error"]["code"] == "proxy_connection_failed"
         assert SECRET not in str(updates) and SECRET not in caplog.text
     finally:

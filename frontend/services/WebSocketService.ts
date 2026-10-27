@@ -21,6 +21,15 @@ export interface BotStats {
   video_id?: string | null;
   active_threads: number;
   active_connections: number;
+  session_counts?: {
+    starting: number;
+    playing: number;
+    buffering: number;
+    retrying: number;
+    ended: number;
+    failed: number;
+    stopped: number;
+  };
   total_proxies: number;
   request_count: number;
   successful_sessions: number;

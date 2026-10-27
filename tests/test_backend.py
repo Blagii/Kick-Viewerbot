@@ -39,6 +39,11 @@ def manager(monkeypatch):
         manager.bot_thread.join(3)
 
 
+def test_idle_stats_expose_empty_session_state_counts(manager):
+    counts = manager.get_stats()["session_counts"]
+    assert counts == {state: 0 for state in backend.SESSION_STATES}
+
+
 def test_manager_prevents_overlapping_start_and_stop(manager):
     assert manager.start_bot("AbCDef12_-X", 1)["success"]
     assert not manager.start_bot("AbCDef12_-X", 1)["success"]

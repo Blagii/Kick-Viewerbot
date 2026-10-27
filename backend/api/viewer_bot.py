@@ -23,6 +23,8 @@ STARTUP_PROXY_RETRY_DELAY = 0.5
 RECONNECT_BASE_DELAY = 5
 MAX_RECONNECT_DELAY = 60
 PLAYER_CHECK_INTERVAL = 5
+PLAYER_STALL_CHECKS = 3
+SESSION_STATES = ("starting", "playing", "buffering", "retrying", "ended", "failed", "stopped")
 
 
 class PlaybackFailure(Exception):
@@ -229,6 +231,7 @@ class ViewerBot:
         self.successful_sessions = 0
         self.failed_attempts = 0
         self.last_error = None
+        self._session_states = ["starting"] * self.nb_of_threads
         self.status = {
             "state": "initialized", "message": "Ready to start YouTube playback.",
             "proxy_count": len(self.all_proxies), "proxy_loading_progress": 100,
@@ -245,6 +248,21 @@ class ViewerBot:
             self.status.update(state=state, message=message, error_code=error_code)
             if progress is not None:
                 self.status["startup_progress"] = progress
+
+    def _set_session_state(self, index, state):
+        """Update the playback counter and one worker's state atomically."""
+        if state not in SESSION_STATES:
+            raise ValueError("Unknown session state.")
+        with self._lock:
+            previous = self._session_states[index]
+            self.active_connections += int(state == "playing") - int(previous == "playing")
+            self._session_states[index] = state
+
+    def _finish_sessions(self):
+        with self._lock:
+            for index, state in enumerate(self._session_states):
+                if state not in {"ended", "failed"}:
+                    self._set_session_state(index, "stopped")
 
     def _next_proxy(self, excluded):
         """Rotate across workers while avoiding repeats in one worker's attempt batch."""
@@ -263,6 +281,7 @@ class ViewerBot:
             return {
                 "active_threads": self.active_threads,
                 "active_connections": self.active_connections,
+                "session_counts": {state: self._session_states.count(state) for state in SESSION_STATES},
                 "request_count": self.request_count,
                 "successful_sessions": self.successful_sessions,
                 "failed_attempts": self.failed_attempts,
@@ -285,6 +304,7 @@ class ViewerBot:
 
     def main(self):
         if self._stop.is_set():
+            self._finish_sessions()
             self._update_status("stopped", "YouTube sessions stopped.")
             return
         self._update_status("starting", "Launching Chromium for YouTube playback...", 10)
@@ -304,6 +324,7 @@ class ViewerBot:
             else:
                 self._update_status("error", message, 0)
         finally:
+            self._finish_sessions()
             with self._lock:
                 self._loop = None
                 self._async_stop = None
@@ -372,7 +393,6 @@ class ViewerBot:
                 pass
             while not self._stop.is_set():
                 context = None
-                playing = False
                 proxy = None
                 stage = "browser_setup"
                 retry_delay = None
@@ -422,13 +442,14 @@ class ViewerBot:
                     except ValueError:
                         pass
                     with self._lock:
-                        self.active_connections += 1
+                        if self._stop.is_set():
+                            return
+                        self._set_session_state(index, "playing")
                         self.successful_sessions += 1
-                        playing = True
+                        self._update_status("running", "YouTube playback is active. Counts are determined by YouTube.", 100)
                     failures = 0
                     has_played = True
                     attempted_proxies.clear()
-                    self._update_status("running", "YouTube playback is active. Counts are determined by YouTube.", 100)
                     stalled = 0
                     while not self._stop.is_set():
                         try:
@@ -443,17 +464,36 @@ class ViewerBot:
                             return {ended: v.ended, error: !!v.error, playing: !v.paused && v.readyState >= 2};
                         }""")
                         if state.get("ended"):
-                            return
-                        now_playing = bool(state.get("playing")) and not state.get("error")
-                        if now_playing != playing:
                             with self._lock:
-                                self.active_connections += 1 if now_playing else -1
-                                playing = now_playing
-                        stalled = 0 if now_playing else stalled + 1
-                        if state.get("missing") or state.get("error") or stalled >= 3:
+                                self._set_session_state(index, "ended")
+                                if self.active_connections == 0 and not self._stop.is_set():
+                                    self._update_status("warning", "A player ended. Waiting for any remaining sessions.", 100)
+                            return
+                        if state.get("error"):
                             raise PlaybackFailure(
-                                "player_stopped",
-                                "The player stopped. The stream may have ended or become unavailable.",
+                                "player_error",
+                                "The player reported a media error. Check the stream, network and any proxy.",
+                            )
+                        now_playing = bool(state.get("playing")) and not state.get("missing")
+                        with self._lock:
+                            previous = self._session_states[index]
+                            self._set_session_state(index, "playing" if now_playing else "buffering")
+                            if not self._stop.is_set() and previous != self._session_states[index]:
+                                if now_playing:
+                                    self._update_status(
+                                        "running", "YouTube playback is active. Counts are determined by YouTube.", 100,
+                                    )
+                                elif self.active_connections == 0:
+                                    self._update_status(
+                                        "warning", "Playback is buffering or temporarily unavailable. Waiting for recovery.", 100,
+                                    )
+                        stalled = 0 if now_playing else stalled + 1
+                        # Player elements can briefly disappear or buffer while the page changes.
+                        # Do not count them as playing, but give them time to recover before restarting.
+                        if stalled >= PLAYER_STALL_CHECKS:
+                            raise PlaybackFailure(
+                                "player_stalled",
+                                "The player could not resume. Check the stream, connection, resources and any proxy.",
                             )
                 except asyncio.CancelledError:
                     raise
@@ -472,10 +512,10 @@ class ViewerBot:
                     else:
                         suffix = ""
                     with self._lock:
+                        self._set_session_state(index, "retrying" if retry_delay is not None else "failed")
                         self.failed_attempts += 1
                         self.last_error = {"code": code, "message": message}
-                        has_playing = self.active_connections > (1 if playing else 0)
-                        if not has_playing and not self._stop.is_set():
+                        if self.active_connections == 0 and not self._stop.is_set():
                             self._update_status(
                                 "warning" if retry_delay is not None else "error",
                                 message + suffix, 100, error_code=code,
@@ -483,9 +523,6 @@ class ViewerBot:
                     if retry_delay is None:
                         return
                 finally:
-                    if playing:
-                        with self._lock:
-                            self.active_connections -= 1
                     if context:
                         try:
                             await context.close()
@@ -498,4 +535,6 @@ class ViewerBot:
                         pass
         finally:
             with self._lock:
+                if self._session_states[index] not in {"ended", "failed"}:
+                    self._set_session_state(index, "stopped")
                 self.active_threads -= 1

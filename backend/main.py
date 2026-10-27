@@ -18,7 +18,7 @@ from flask import Flask, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 
-from backend.api.viewer_bot import ViewerBot
+from backend.api.viewer_bot import SESSION_STATES, ViewerBot
 from backend.api.youtube import fetch_live_viewers, normalize_youtube_target, youtube_video_id
 
 logging.basicConfig(
@@ -92,7 +92,8 @@ class BotManager:
             }
             self.last_net_io, self.last_net_io_time = net, now
             details = self.bot.snapshot() if self.bot else {
-                "active_threads": 0, "active_connections": 0, "request_count": 0,
+                "active_threads": 0, "active_connections": 0,
+                "session_counts": {state: 0 for state in SESSION_STATES}, "request_count": 0,
                 "successful_sessions": 0, "failed_attempts": 0, "last_error": None,
                 "total_proxies": 0, "video_id": None,
                 "status": {"state": "stopped", "message": "Ready to start YouTube playback.",
