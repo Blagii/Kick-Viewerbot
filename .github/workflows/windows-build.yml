@@ -1,0 +1,77 @@
+name: Windows one-click download
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      BACKEND_URL: http://127.0.0.1:8765
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Install dashboard dependencies
+        run: npm ci
+        working-directory: frontend
+      - name: Build the standalone dashboard
+        run: npm run build
+        working-directory: frontend
+      - name: Package Python, Node and the app
+        shell: pwsh
+        run: |
+          $node = (Get-Command node.exe).Source
+          python scripts/package_windows.py --output "$env:RUNNER_TEMP\YouTube Viewer Windows" --node "$node"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test launcher and Windows process cleanup
+        run: |
+          python -m pip install pytest
+          python -m pytest -q tests/test_windows_launcher.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test the portable double-click launcher
+        shell: pwsh
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}\youtube-chromium
+        run: |
+          # The package must work without Python or Node on PATH and must ignore
+          # conflicting Python environment variables. The first run downloads Chromium.
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $env:PYTHONHOME = "Z:\incorrect-python-home"
+          $env:PYTHONPATH = "Z:\incorrect-python-path"
+          Remove-Item Env:CHROMIUM_PATH -ErrorAction SilentlyContinue
+          $launcher = "$env:RUNNER_TEMP\YouTube Viewer Windows\Start YouTube Viewer.bat"
+          & $launcher --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Run twice to check reuse of Chromium and cleanup of both servers.
+          & $launcher --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test the source-checkout launcher
+        shell: pwsh
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}\youtube-chromium
+        run: |
+          & "$env:GITHUB_WORKSPACE\Start YouTube Viewer.bat" --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the Windows download
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTubeViewer-Windows-x64
+          path: ${{ runner.temp }}/YouTube Viewer Windows/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

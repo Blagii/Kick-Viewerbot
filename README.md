@@ -4,14 +4,26 @@ A local dashboard for opening and monitoring YouTube playback sessions. This ver
 
 > **Important:** YouTube decides which activity counts as a view or concurrent viewer and may filter automated traffic. Opening playback sessions **does not guarantee views or an increase in the counter**. Automating or manipulating engagement can violate YouTube's terms. Use responsibly and only where permitted.
 
-## Requirements
+## Windows: one-click launch
+
+For Windows 10/11 **64-bit**, download the `YouTubeViewer-Windows-x64` artifact from a successful [Windows one-click download workflow run](https://github.com/Blagii/Kick-Viewerbot/actions/workflows/windows-build.yml). For a pull request, select its successful workflow run and download the artifact from the run's **Artifacts** section. GitHub may require you to sign in; workflow artifacts expire after 14 days.
+
+1. Extract the entire ZIP into a writable folder, such as Documents. Do not run it directly from inside the ZIP.
+2. Double-click **`Start YouTube Viewer.bat`**. The first launch automatically downloads Chromium and can take several minutes; subsequent launches reuse it. The portable download includes Python, Node.js, and app dependencies, so no separate Python or Node installation is required.
+3. The dashboard opens in your default browser. Leave the launcher window open; press Enter in it or close the window to stop the app and its child processes.
+
+An internet connection is required for the initial Chromium download and YouTube playback. The launcher binds its backend and dashboard to `127.0.0.1` only and checks for port conflicts. If startup fails, read the message in the launcher; backend and dashboard logs are in `%LOCALAPPDATA%\YouTubeViewer\logs`. A second launch opens the existing dashboard when both services are already running.
+
+If you use a **source checkout** instead of the portable download, the same batch file can set up dependencies and launch it, but 64-bit Python 3.9+ (3.11 recommended) and Node.js 18.18+ (22 recommended, including npm) must already be installed. Initial dependency setup also needs internet access.
+
+## Requirements for running from source
 
 - Python 3.9 or newer and Node.js 18.18 or newer
 - A supported desktop OS and internet access to YouTube
 - Playwright's Chromium browser (installed below). Linux may also need Playwright's system dependencies; see [Playwright installation](https://playwright.dev/python/docs/intro#installing-playwright).
 - Resources and bandwidth for each browser session; start with one or two sessions.
 
-## Install
+## Install from source
 
 From the project directory:
 
@@ -104,7 +116,7 @@ The unit tests mock YouTube and browser calls, so they run without a YouTube con
 
 ## Migration notes
 
-The old Kick chat bot, Kick account/Patreon service, stability-mode claims, Kick executable builds, and Kick update feed are **not** YouTube features and are not used by the new dashboard. Some old files remain for reference; previous Kick releases are not YouTube builds. There is currently no YouTube chat integration or packaged executable; run from source using the steps above.
+The old Kick chat bot, Kick account/Patreon service, stability-mode claims, Kick executable builds, and Kick update feed are **not** YouTube features and are not used by the new dashboard. Some old files remain for reference; previous Kick releases are not YouTube builds. There is currently no YouTube chat integration. The Windows download uses a batch launcher and a bundled runtime, not the legacy Kick executable.
 
 ## License
 
